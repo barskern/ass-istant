@@ -35,20 +35,28 @@ impl Impersonator {
         }
     }
 
-    pub fn init_chat_history(&self, chat_id: String, history: Vec<ChatMessage>) {
-        let mut histories = self.histories.blocking_lock();
-        if histories.contains_key(&chat_id) {
+    pub async fn init_chat_history(&self, chat_id: &str, history: Vec<ChatMessage>) {
+        let mut histories = self.histories.lock().await;
+        if histories.contains_key(chat_id) {
             warn!("tried to init already existing chat history, skipping..");
+            return;
         }
-        histories.insert(chat_id, Arc::new(Mutex::new(history)));
+
+        debug!("init history to: {:?}", &history);
+        histories.insert(chat_id.to_owned(), Arc::new(Mutex::new(history)));
     }
 
-    pub fn new_blank_history(&self, _chat_id: &str, message_from_name: &str) -> Vec<ChatMessage> {
-        vec![ChatMessage::system(
+    pub fn new_blank_history(
+        &self,
+        _chat_id: &str,
+        message_from_name: &str,
+    ) -> impl Iterator<Item = ChatMessage> {
+        [ChatMessage::system(
             self.config
                 .system_prompt_direct_message
                 .replace("{name}", message_from_name),
         )]
+        .into_iter()
     }
 
     pub async fn commit_to_history(
@@ -86,7 +94,7 @@ impl Impersonator {
                     // Hopefully we don't hit this path, as we rather want the initialized
                     // histories from previous chats (see `Handler::init_chat_histories`).
                     let new = Arc::new(Mutex::new(
-                        self.new_blank_history(chat_id, message_from_name),
+                        self.new_blank_history(chat_id, message_from_name).collect(),
                     ));
                     histories.insert(chat_id.into(), Arc::clone(&new));
                     new

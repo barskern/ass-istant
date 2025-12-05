@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
     let impersonator = Impersonator::new(Ollama::default(), config.impersonator);
 
     let handler = Manager::new(api.clone(), config.chat, impersonator, event_tx);
-    handler.init_chat_histories().await;
+    handler.init().await;
 
     api.connect_to_websocket(handler).await.unwrap();
 

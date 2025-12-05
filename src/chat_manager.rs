@@ -1,19 +1,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
+use axum::http::Method;
 use dashmap::DashMap;
 use futures::TryFutureExt;
 use mattermost_api::prelude::*;
 use ollama_rs::generation::chat::ChatMessage;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::join;
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tokio_util::task::TaskTracker;
+use tracing::{debug, info, trace, warn};
 
 use crate::impersonator::Impersonator;
 use crate::utils::human_message_duration;
@@ -28,11 +30,27 @@ pub struct Config {
     chats: HashMap<String, ChatConfig>,
 }
 
-#[derive(serde::Deserialize, Debug)]
+#[derive(serde::Deserialize, Clone, Debug)]
 struct ChatConfig {
     #[serde(default)]
     should_prefix: bool,
     friend_name: String,
+}
+
+impl ChatConfig {
+    pub fn preprocess_message(&self, message: String) -> String {
+        let ChatConfig { should_prefix, .. } = self;
+        if *should_prefix {
+            // In a prefixing chat, we remove all prefixes when processing the messages
+            message
+                .trim_start_matches(CMD_PREFIX)
+                .trim_start_matches(AI_PREFIX)
+                .trim()
+                .to_string()
+        } else {
+            message
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -65,11 +83,28 @@ struct InflightState {
 
 #[derive(Clone)]
 pub struct Manager {
+    // TODO Add rate limiting and retrying to the API here!
     api: Mattermost,
+
+    // TODO We probably actually rather want one impersonator per chat instead,
+    // only "usecase" for one impersonator is consistency across chats, but
+    // thats probably too complex anyway.
     impersonator: Arc<Impersonator>,
     config: Arc<Config>,
     event_tx: mpsc::Sender<WebsocketEvent>,
     inflight_responses: Arc<DashMap<String, InflightState>>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct PostForChannel {
+    user_id: String,
+    message: String,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct PostsForChannel {
+    order: Vec<String>,
+    posts: HashMap<String, PostForChannel>,
 }
 
 impl Manager {
@@ -88,9 +123,84 @@ impl Manager {
         }
     }
 
-    pub async fn init_chat_histories(&self) {
-        // TODO Fetch the latest N messages from a chat to initialize the impersonator history
-        // to make it handle restarts better.
+    pub async fn init(&self) {
+        let tasks = TaskTracker::new();
+
+        tasks.spawn({
+            let this = self.clone();
+            async move {
+                this.init_chat_histories().await;
+            }
+        });
+
+        tasks.close();
+        tasks.wait().await;
+    }
+
+    async fn init_chat_histories(&self) {
+        let lookback_duration = Duration::from_secs(2 * 24 * 60 * 60);
+        let since_unix_ms = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.saturating_sub(lookback_duration))
+            .unwrap_or(Duration::ZERO)
+            .as_millis();
+
+        let mut chat_init_tasks = JoinSet::new();
+        for (chat_id, chat_config) in self.config.chats.iter() {
+            chat_init_tasks.spawn({
+                let this = self.clone();
+                let chat_id = chat_id.clone();
+                let chat_config = chat_config.clone();
+
+                async move {
+                    let ChatConfig { friend_name, .. } = &chat_config;
+                    let channel_id = &chat_id;
+
+                    debug!(chat_id, "fetching chat posts...");
+                    let Ok(mut res) = this
+                        .api
+                        .query::<PostsForChannel>(
+                            Method::GET.as_str(),
+                            &format!("channels/{channel_id}/posts"),
+                            Some(&[("since", &since_unix_ms.to_string())]),
+                            None,
+                        )
+                        .await
+                        .inspect_err(|e| warn!("failed to download chat posts: {e:?}"))
+                    else {
+                        return;
+                    };
+
+                    let raw_message_history = res
+                        .order
+                        .iter()
+                        .rev()
+                        .filter_map(|post_id| res.posts.remove(post_id))
+                        .map(|m| {
+                            let has_ai_prefix = m.message.starts_with(AI_PREFIX);
+                            let from_me = m.user_id == this.config.my_user_id;
+
+                            let message = chat_config.preprocess_message(m.message);
+                            if (from_me && !chat_config.should_prefix)
+                                || (has_ai_prefix && chat_config.should_prefix)
+                            {
+                                ChatMessage::assistant(message)
+                            } else {
+                                ChatMessage::user(message)
+                            }
+                        });
+
+                    let history = this
+                        .impersonator
+                        .new_blank_history(&chat_id, friend_name)
+                        .chain(raw_message_history)
+                        .collect();
+
+                    this.impersonator.init_chat_history(&chat_id, history).await;
+                }
+            });
+        }
+        chat_init_tasks.join_all().await;
     }
 
     async fn respond_to_post_message(
@@ -135,39 +245,50 @@ impl Manager {
 
         let deliberation_time =
             human_message_duration(&latest_message, read_chars_per_sec) + Duration::from_secs(5);
+        let typing_notification_interval = Duration::from_secs(2);
 
-        let (_, maybe_chat_response) = join!(
-            cancel.clone().run_until_cancelled_owned(async move {
+        let typing_cancel = CancellationToken::new();
+        tokio::spawn({
+            let this = self.clone();
+            let typing_cancel = typing_cancel.clone();
+            let cancel = cancel.clone();
+            let my_user_id = my_user_id.clone();
+            let channel_id = channel_id.clone();
+
+            cancel.run_until_cancelled_owned(async move {
                 // This makes us wait a bit before we send the typing notification
                 time::sleep(deliberation_time).await;
-                // TODO Figure out how "often" we have to send the typing notification
-                let _ = self
-                    .api
-                    .post::<_, serde_json::Value>(
-                        &format!("users/{my_user_id}/typing"),
-                        None,
-                        &json!({"channel_id": channel_id}),
-                    )
-                    .inspect_err(|e| {
-                        warn!("failed to send typing status: {e:?}");
+
+                typing_cancel
+                    .run_until_cancelled_owned(async move {
+                        loop {
+                            trace!("sending typing notification...");
+                            let _ = this
+                                .api
+                                .post::<_, serde_json::Value>(
+                                    &format!("users/{my_user_id}/typing"),
+                                    None,
+                                    &json!({"channel_id": channel_id}),
+                                )
+                                .inspect_err(|e| {
+                                    warn!("failed to send typing status: {e:?}");
+                                })
+                                .await;
+
+                            time::sleep(typing_notification_interval).await;
+                        }
                     })
                     .await;
-            }),
-            {
-                let cancel = cancel.clone();
-                let chat_id = chat_id.clone();
-                let messages = messages.clone();
-                async move {
-                    cancel
-                        .run_until_cancelled(self.impersonator.respond_to_messages(
-                            &chat_id,
-                            friend_name,
-                            messages,
-                        ))
-                        .await
-                }
-            }
-        );
+            })
+        });
+
+        let maybe_chat_response = cancel
+            .run_until_cancelled(self.impersonator.respond_to_messages(
+                &chat_id,
+                friend_name,
+                messages.clone(),
+            ))
+            .await;
 
         let Some(chat_response) = maybe_chat_response else {
             debug!("response was cancelled, not sending anything..");
@@ -215,6 +336,9 @@ impl Manager {
             return Ok(());
         }
 
+        // Stop sending typing notifications just before we send the real message
+        typing_cancel.cancel();
+
         self.api
             .post::<_, serde_json::Value>(
                 "posts",
@@ -237,49 +361,77 @@ impl Manager {
         let Some(chat_config) = self.config.chats.get(post_message.chat_id()) else {
             return false;
         };
-        let message = &post_message.content.message;
-
-        let from_me = post_message.content.user_id == self.config.my_user_id;
         if chat_config.should_prefix {
             // In prefixing chats, answer all messages NOT starting with the AI prefix
-            !message.starts_with(AI_PREFIX)
+            !post_message.content.message.starts_with(AI_PREFIX)
         } else {
-            // In non-prefixing chats, answer all messages from others,
-            // or messages from me with command prefix.
-            !from_me || message.starts_with(CMD_PREFIX)
+            // In non-prefixing chats, handle all messages (messages from "us" will only be
+            // added to the history, so that the "owner" and inject wanted messages)
+            true
         }
     }
 
-    fn process_post_message(&self, message: PostMessage) {
+    fn process_post_message(&self, mut message: PostMessage) {
         if self.should_handle_post(&message) {
             debug!("processing message: {message:?}");
-
-            let chat_message = ChatMessage::user(message.content.message.clone());
-            let messages = {
-                if let Some((_, inflight_state)) = self.inflight_responses.remove(message.chat_id())
-                {
-                    // TODO Should we unconditionally cancel?? Verify that this works
-                    // even if we already finished and added to history..
-                    inflight_state.cancel.cancel();
-                    let mut messages = inflight_state.messages;
-                    messages.push(chat_message);
-                    messages
-                } else {
-                    vec![chat_message]
-                }
-            };
-
             tokio::spawn({
                 let this = self.clone();
-                let cancel = CancellationToken::new();
+                let chat_id = message.chat_id().to_owned();
+
                 async move {
-                    this.inflight_responses.insert(
-                        message.chat_id().into(),
-                        InflightState {
-                            cancel: cancel.clone(),
-                            messages: messages.clone(),
-                        },
-                    );
+                    let Some(chat_config) = this.config.chats.get(&chat_id) else {
+                        return;
+                    };
+                    message.content.message =
+                        chat_config.preprocess_message(message.content.message);
+
+                    let is_from_me = message.content.user_id == this.config.my_user_id;
+                    if is_from_me && !chat_config.should_prefix {
+                        // User injected a message into a non-prefixing chat, so we simply add it into the history as
+                        // a assistant message!
+
+                        debug!("injecting assistant message: {:?}", message.content.message);
+                        let injected_message = ChatMessage::assistant(message.content.message);
+                        this.impersonator
+                            .commit_to_history(&chat_id, [injected_message])
+                            .await;
+
+                        return;
+                    }
+
+                    let chat_message = ChatMessage::user(message.content.message.clone());
+                    let messages = {
+                        if let Some((_, inflight_state)) = this.inflight_responses.remove(&chat_id)
+                        {
+                            // TODO Should we unconditionally cancel?? Verify that this works
+                            // even if we already finished and added to history..
+                            inflight_state.cancel.cancel();
+
+                            let mut messages = inflight_state.messages;
+                            messages.push(chat_message);
+                            messages
+                        } else {
+                            vec![chat_message]
+                        }
+                    };
+
+                    let cancel = CancellationToken::new();
+                    {
+                        let existing = this.inflight_responses.insert(
+                            chat_id,
+                            InflightState {
+                                cancel: cancel.clone(),
+                                messages: messages.clone(),
+                            },
+                        );
+                        if let Some(existing) = existing {
+                            // This should not happen (I hope!)
+                            warn!(
+                                "when inserting inflight state, already existing found, cancelling it.."
+                            );
+                            existing.cancel.cancel();
+                        }
+                    }
 
                     let _ = this
                         .respond_to_post_message(message, messages, cancel)
