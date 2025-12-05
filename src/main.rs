@@ -1,10 +1,13 @@
 use std::env;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mattermost_api::prelude::*;
 use ollama_rs::Ollama;
-use tracing::info;
+use tokio::{signal, time};
+use tokio_util::sync::CancellationToken;
 use tracing::level_filters::LevelFilter;
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::chat_manager::Manager;
@@ -40,6 +43,9 @@ async fn main() -> Result<()> {
 
     info!(?config, "parsed configuration");
 
+    let cancel = CancellationToken::new();
+    tokio::spawn(cancel_on_shutdown(cancel.clone()));
+
     let auth_manager = oauth::Manager::new(config.oauth);
     tokio::spawn(auth_manager.background_task());
 
@@ -58,7 +64,42 @@ async fn main() -> Result<()> {
     let handler = Manager::new(api.clone(), config.chat, impersonator, event_tx);
     handler.init().await;
 
-    api.connect_to_websocket(handler).await.unwrap();
+    let background_tasks = handler.background_tasks(cancel.clone());
+
+    // Wait for shutdown
+    cancel.cancelled().await;
+
+    if let Err(e) = time::timeout(Duration::from_secs(3), background_tasks).await {
+        error!("timed out while waiting for background tasks to shutdown: {e:?}");
+    }
 
     Ok(())
+}
+
+async fn cancel_on_shutdown(cancel: CancellationToken) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    tracing::info!("got shutdown signal, stopping!");
+
+    cancel.cancel();
 }

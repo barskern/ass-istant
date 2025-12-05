@@ -8,6 +8,7 @@ use ollama_rs::generation::chat::request::ChatMessageRequest;
 use ollama_rs::generation::parameters::{KeepAlive, TimeUnit};
 use ollama_rs::models::ModelOptions;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 use tracing::{debug, warn};
 
 type SharedHistory = Arc<Mutex<Vec<ChatMessage>>>;
@@ -78,6 +79,10 @@ impl Impersonator {
         debug!("history is now: {history:?}");
     }
 
+    pub async fn clean_history(&self) {
+        // TODO Ensure that history is not too big, remove old cruft
+    }
+
     // NOTE! Does NOT commit response to history!
     pub async fn respond_to_messages(
         &self,
@@ -119,11 +124,17 @@ impl Impersonator {
                 unit: TimeUnit::Minutes,
             });
 
+        let start_ollama = Instant::now();
         let mut res = self
             .client
             .send_chat_messages(request)
             .await
             .context("sending chat message to ollama")?;
+        let ollama_duration = start_ollama.elapsed();
+        debug!(
+            "ollama spent {}s to generate an answer",
+            ollama_duration.as_secs()
+        );
 
         if !res.done {
             warn!("response wasn't done for some reason: {res:?}");
@@ -136,11 +147,17 @@ impl Impersonator {
             );
         }
 
+        let start_humanize = Instant::now();
         res.message.content = self
             .humanize_message(res.message.content.trim())
             .await
             .inspect_err(|e| warn!("failed to humanize message: {e:?}"))
             .unwrap_or_else(|_| res.message.content.trim().to_string());
+        let humanize_duration = start_humanize.elapsed();
+        debug!(
+            "humanizer spent {}s to humanize",
+            humanize_duration.as_secs()
+        );
 
         Ok(res.message)
     }

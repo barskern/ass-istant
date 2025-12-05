@@ -15,7 +15,7 @@ use tokio::task::JoinSet;
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::impersonator::Impersonator;
 use crate::utils::human_message_duration;
@@ -132,6 +132,51 @@ impl Manager {
 
         tasks.close();
         tasks.wait().await;
+    }
+
+    pub fn background_tasks(&self, cancel: CancellationToken) -> impl Future<Output = ()> + use<> {
+        let tasks = TaskTracker::new();
+
+        tasks.spawn({
+            let this = self.clone();
+            let cancel = cancel.clone();
+            let clean_history_interval = Duration::from_secs(60 * 60);
+
+            cancel.run_until_cancelled_owned(async move {
+                loop {
+                    time::sleep(clean_history_interval).await;
+                    this.impersonator.clean_history().await;
+                }
+            })
+        });
+
+        tasks.spawn({
+            let this = self.clone();
+            let cancel = cancel.clone();
+            async move {
+                loop {
+                    debug!("starting websocket event handler");
+                    match cancel
+                        .run_until_cancelled(this.api.clone().connect_to_websocket(this.clone()))
+                        .await
+                    {
+                        Some(Err(e)) => {
+                            error!("failed while handling websocket: {e:?}");
+                        }
+                        Some(Ok(_)) => {
+                            info!("websocket gracefully shutdown");
+                        }
+                        None => break,
+                    };
+
+                    // Retry to run websocket connection every minute if failing..
+                    time::sleep(Duration::from_secs(60)).await;
+                }
+            }
+        });
+
+        tasks.close();
+        async move { tasks.wait().await }
     }
 
     async fn init_chat_histories(&self) {

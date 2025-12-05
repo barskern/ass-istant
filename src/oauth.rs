@@ -71,6 +71,7 @@ impl Manager {
             .clone()
     }
 
+    // TODO Make this cancel safe!
     pub fn background_task(&self) -> impl Future<Output = ()> + use<> {
         let this = self.clone();
 
