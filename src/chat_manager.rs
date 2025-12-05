@@ -434,11 +434,13 @@ impl Manager {
                         // User injected a message into a non-prefixing chat, so we simply add it into the history as
                         // a assistant message!
 
-                        debug!("injecting assistant message: {:?}", message.content.message);
-                        let injected_message = ChatMessage::assistant(message.content.message);
-                        this.impersonator
-                            .commit_to_history(&chat_id, [injected_message])
-                            .await;
+                        // TODO How to separate injected messages from AI generated ones..
+
+                        //debug!("injecting assistant message: {:?}", message.content.message);
+                        //let injected_message = ChatMessage::assistant(message.content.message);
+                        //this.impersonator
+                        //    .commit_to_history(&chat_id, [injected_message])
+                        //    .await;
 
                         return;
                     }
