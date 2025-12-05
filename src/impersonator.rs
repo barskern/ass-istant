@@ -36,12 +36,14 @@ impl Impersonator {
         }
     }
 
-    pub async fn init_chat_history(&self, chat_id: &str, history: Vec<ChatMessage>) {
+    pub async fn init_chat_history(&self, chat_id: &str, mut history: Vec<ChatMessage>) {
         let mut histories = self.histories.lock().await;
         if histories.contains_key(chat_id) {
             warn!("tried to init already existing chat history, skipping..");
             return;
         }
+
+        clean_history(&mut history, self.config.max_chars_in_history);
 
         debug!("init history to: {:?}", &history);
         histories.insert(chat_id.to_owned(), Arc::new(Mutex::new(history)));
@@ -79,8 +81,21 @@ impl Impersonator {
         debug!("history is now: {history:?}");
     }
 
-    pub async fn clean_history(&self) {
-        // TODO Ensure that history is not too big, remove old cruft
+    /// Ensure that histories are not too big, remove old cruft
+    pub async fn clean_histories(&self) {
+        debug!("cleaning history!");
+
+        let shared_histories: Vec<_> = {
+            let histories = self.histories.lock().await;
+            histories.values().map(Arc::clone).collect()
+        };
+
+        for shared_history in shared_histories {
+            {
+                let mut history = shared_history.lock().await;
+                clean_history(&mut history, self.config.max_chars_in_history);
+            }
+        }
     }
 
     // NOTE! Does NOT commit response to history!
@@ -196,6 +211,8 @@ pub struct Config {
     pub system_prompt_humanizer: String,
     #[serde(default = "default_model_name")]
     pub model_name: String,
+    #[serde(default = "default_max_chars_in_history")]
+    pub max_chars_in_history: usize,
 }
 
 fn default_prompt_humanizer() -> String {
@@ -210,4 +227,29 @@ You will always receive a single message, and you will reply with ONLY the refor
 
 fn default_model_name() -> String {
     "gemma3:12b".into()
+}
+
+fn default_max_chars_in_history() -> usize {
+    3000
+}
+
+fn clean_history(history: &mut Vec<ChatMessage>, max_chars_in_history: usize) {
+    let rev_cutoff = history
+        .iter()
+        .rev()
+        .position({
+            let mut chars_seen = 0;
+            move |m| {
+                chars_seen += m.content.len();
+                chars_seen >= max_chars_in_history
+            }
+        })
+        .unwrap_or(0);
+
+    let keep_from_index = history.len().saturating_sub(rev_cutoff);
+    if keep_from_index > 1 {
+        debug!("tossing {} messages from history", keep_from_index - 1);
+        // We keep the first system prompt, but throw all other messages until our keep from index
+        history.drain(1..keep_from_index);
+    }
 }

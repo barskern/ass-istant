@@ -145,7 +145,7 @@ impl Manager {
             cancel.run_until_cancelled_owned(async move {
                 loop {
                     time::sleep(clean_history_interval).await;
-                    this.impersonator.clean_history().await;
+                    this.impersonator.clean_histories().await;
                 }
             })
         });
