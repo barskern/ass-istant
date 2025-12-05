@@ -41,14 +41,11 @@ impl ChatConfig {
     pub fn preprocess_message(&self, message: String) -> String {
         let ChatConfig { should_prefix, .. } = self;
         if *should_prefix {
-            // In a prefixing chat, we remove all prefixes when processing the messages
-            message
-                .trim_start_matches(CMD_PREFIX)
-                .trim_start_matches(AI_PREFIX)
-                .trim()
-                .to_string()
+            // In a prefixing chat, we remove AI prefix before sending to the LLM
+            message.trim_start_matches(AI_PREFIX).trim().to_string()
         } else {
-            message
+            // In a non-prefixing chat, we remove the command prefix before sending to the LLM
+            message.trim_start_matches(CMD_PREFIX).trim().to_string()
         }
     }
 }
@@ -178,10 +175,11 @@ impl Manager {
                         .filter_map(|post_id| res.posts.remove(post_id))
                         .map(|m| {
                             let has_ai_prefix = m.message.starts_with(AI_PREFIX);
+                            let has_cmd_prefix = m.message.starts_with(CMD_PREFIX);
                             let from_me = m.user_id == this.config.my_user_id;
 
                             let message = chat_config.preprocess_message(m.message);
-                            if (from_me && !chat_config.should_prefix)
+                            if (from_me && !chat_config.should_prefix && !has_cmd_prefix)
                                 || (has_ai_prefix && chat_config.should_prefix)
                             {
                                 ChatMessage::assistant(message)
@@ -382,11 +380,12 @@ impl Manager {
                     let Some(chat_config) = this.config.chats.get(&chat_id) else {
                         return;
                     };
+                    let has_cmd_prefix = message.content.message.starts_with(CMD_PREFIX);
                     message.content.message =
                         chat_config.preprocess_message(message.content.message);
 
                     let is_from_me = message.content.user_id == this.config.my_user_id;
-                    if is_from_me && !chat_config.should_prefix {
+                    if is_from_me && !chat_config.should_prefix && !has_cmd_prefix {
                         // User injected a message into a non-prefixing chat, so we simply add it into the history as
                         // a assistant message!
 
