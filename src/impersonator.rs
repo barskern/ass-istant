@@ -86,7 +86,7 @@ impl Impersonator {
                     // Hopefully we don't hit this path, as we rather want the initialized
                     // histories from previous chats (see `Handler::init_chat_histories`).
                     let new = Arc::new(Mutex::new(
-                        self.new_blank_history(&chat_id, message_from_name),
+                        self.new_blank_history(chat_id, message_from_name),
                     ));
                     histories.insert(chat_id.into(), Arc::clone(&new));
                     new
@@ -182,7 +182,6 @@ You may change leading characters to lowercase, add typos and skip trailing peri
 You will always receive a single message, and you will reply with ONLY the reformatted message.
 "#.into()
 }
-
 
 fn default_model_name() -> String {
     "gemma3:12b".into()

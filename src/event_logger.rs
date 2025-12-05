@@ -17,7 +17,7 @@ pub fn start_event_logger<T: Serialize + Send + 'static>() -> mpsc::Sender<T> {
     let (event_tx, mut event_rx) = mpsc::channel::<T>(50);
 
     thread::spawn(move || {
-        let mut event_logger = EventLogger::new();
+        let mut event_logger = EventLogger::default();
         while let Some(evt) = event_rx.blocking_recv() {
             if let Err(e) = event_logger.log(evt) {
                 warn!("failed to log event: {e:?}");
@@ -37,15 +37,6 @@ pub struct EventLogger {
 }
 
 impl EventLogger {
-    pub fn new() -> Self {
-        let now = std::time::SystemTime::now();
-        let dur = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        Self {
-            name: format!("event-log-{dur}"),
-            unwritten_bytes: Default::default(),
-        }
-    }
-
     pub fn log<E: Serialize>(&mut self, event: E) -> Result<()> {
         {
             let mut serializer = Serializer::new(&mut self.unwritten_bytes);
@@ -92,6 +83,17 @@ impl EventLogger {
 
         self.unwritten_bytes.clear();
         Ok(())
+    }
+}
+
+impl Default for EventLogger {
+    fn default() -> Self {
+        let now = std::time::SystemTime::now();
+        let dur = now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        Self {
+            name: format!("event-log-{dur}"),
+            unwritten_bytes: Default::default(),
+        }
     }
 }
 

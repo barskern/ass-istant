@@ -112,7 +112,11 @@ impl Manager {
         } = post_message;
         let my_user_id = &self.config.my_user_id;
 
-        let Some(ChatConfig { should_prefix, friend_name }) = self.config.chats.get(&chat_id) else {
+        let Some(ChatConfig {
+            should_prefix,
+            friend_name,
+        }) = self.config.chats.get(&chat_id)
+        else {
             return Err(anyhow!(
                 "did not find channel config for message: {latest_message:?}"
             ));
@@ -205,7 +209,7 @@ impl Manager {
             self.inflight_responses.remove(&chat_id);
         }
         // Normally cancel cannot happen after the inflight_state has been removed,
-        // but if it does happen, it means that cancel was extraced before we were able to
+        // but if it does happen, it means that cancel was extracted before we were able to
         // remove it, so stop here.
         if cancel.is_cancelled() {
             return Ok(());

@@ -109,7 +109,7 @@ impl Manager {
                             .unwrap_or(Duration::ZERO);
 
                         if until_refresh.is_zero() {
-                            error!("new token is not valid for more than configred grace period!");
+                            error!("new token is not valid for more than configured grace period!");
                             tokio::time::sleep(this.config.token_refresh_error_backoff).await;
                         } else {
                             this.token.write(new_token.clone()).await;
@@ -137,19 +137,15 @@ impl Manager {
     }
 
     async fn update_token(&self) -> Result<TokenWrapper> {
-        match self.token.fetch().await {
-            Some(current_token) => {
-                if let Ok(refreshed_token) = self
-                    .refresh_token_flow(current_token)
+        if let Some(current_token) = self.token.fetch().await
+            && let Ok(refreshed_token) =
+                self.refresh_token_flow(current_token)
                     .await
                     .inspect_err(|e| {
                         warn!("failed to refresh token: {e:?}");
                     })
-                {
-                    return Ok(refreshed_token);
-                };
-            }
-            _ => {}
+        {
+            return Ok(refreshed_token);
         };
 
         info!("running initial auth flow!");
@@ -253,12 +249,10 @@ impl Manager {
                     .await;
             });
 
-            let auth_code = receiver
+            receiver
                 .recv()
                 .await
-                .ok_or(anyhow!("callback sender closed unexpectedly"))?;
-
-            auth_code
+                .ok_or(anyhow!("callback sender closed unexpectedly"))?
         };
 
         let requested_at = Utc::now();

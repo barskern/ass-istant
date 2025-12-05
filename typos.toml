@@ -1,0 +1,9 @@
+[default]
+extend-ignore-re = [
+	# Line ignore with trailing "spellchecker:disable-line"
+	"(?Rm)^.*#\\s*spellchecker:disable-line$",
+	# Ignore next line with "spellchecker:ignore-next-line"
+	"(#|//)\\s*spellchecker:ignore-next-line\\n.*",
+	# Line block with "spellchecker:<on|off>"
+	"(?s)(#|//)\\s*spellchecker:off.*?\\n\\s*(#|//)\\s*spellchecker:on",
+]
