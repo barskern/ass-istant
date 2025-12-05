@@ -9,7 +9,7 @@ use ollama_rs::generation::parameters::{KeepAlive, TimeUnit};
 use ollama_rs::models::ModelOptions;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
-use tracing::{debug, warn};
+use tracing::{debug, instrument, trace, warn};
 
 type SharedHistory = Arc<Mutex<Vec<ChatMessage>>>;
 
@@ -43,7 +43,11 @@ impl Impersonator {
             return;
         }
 
-        clean_history(&mut history, self.config.max_chars_in_history);
+        clean_history(
+            &mut history,
+            self.config.max_chars_in_history,
+            self.config.at_least_n_messages_in_history,
+        );
 
         debug!("init history to: {:?}", &history);
         histories.insert(chat_id.to_owned(), Arc::new(Mutex::new(history)));
@@ -93,7 +97,11 @@ impl Impersonator {
         for shared_history in shared_histories {
             {
                 let mut history = shared_history.lock().await;
-                clean_history(&mut history, self.config.max_chars_in_history);
+                clean_history(
+                    &mut history,
+                    self.config.max_chars_in_history,
+                    self.config.at_least_n_messages_in_history,
+                );
             }
         }
     }
@@ -213,6 +221,8 @@ pub struct Config {
     pub model_name: String,
     #[serde(default = "default_max_chars_in_history")]
     pub max_chars_in_history: usize,
+    #[serde(default = "default_at_least_n_messages_in_history")]
+    pub at_least_n_messages_in_history: usize,
 }
 
 fn default_prompt_humanizer() -> String {
@@ -230,11 +240,20 @@ fn default_model_name() -> String {
 }
 
 fn default_max_chars_in_history() -> usize {
-    3000
+    8000
 }
 
-fn clean_history(history: &mut Vec<ChatMessage>, max_chars_in_history: usize) {
-    let rev_cutoff = history
+fn default_at_least_n_messages_in_history() -> usize {
+    8
+}
+
+#[instrument(level = "trace", skip(history))]
+fn clean_history(
+    history: &mut Vec<ChatMessage>,
+    max_chars_in_history: usize,
+    at_least_n_messages: usize,
+) {
+    let rev_keep_from_index = history
         .iter()
         .rev()
         .position({
@@ -244,11 +263,20 @@ fn clean_history(history: &mut Vec<ChatMessage>, max_chars_in_history: usize) {
                 chars_seen >= max_chars_in_history
             }
         })
-        .unwrap_or(0);
+        .unwrap_or(history.len());
 
-    let keep_from_index = history.len().saturating_sub(rev_cutoff);
+    if rev_keep_from_index < at_least_n_messages {
+        trace!(rev_keep_from_index, "using at least n messages limit");
+    } else {
+        trace!(rev_keep_from_index, "using max char limit");
+    }
+
+    let keep_from_index = history
+        .len()
+        .saturating_sub(rev_keep_from_index.max(at_least_n_messages));
+
     if keep_from_index > 1 {
-        debug!("tossing {} messages from history", keep_from_index - 1);
+        trace!("tossing {} messages from history", keep_from_index - 1);
         // We keep the first system prompt, but throw all other messages until our keep from index
         history.drain(1..keep_from_index);
     }
