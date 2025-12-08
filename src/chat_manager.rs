@@ -341,6 +341,7 @@ impl Manager {
             })
         });
 
+        debug!("starting to generate a response...");
         let maybe_chat_response = cancel
             .run_until_cancelled(self.impersonator.generate_a_response(chat_id, chat_config))
             .await;
