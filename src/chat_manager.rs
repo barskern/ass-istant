@@ -66,6 +66,10 @@ pub struct ChatConfig {
     #[serde(default)]
     pub should_prefix: bool,
     pub friend_name: String,
+    #[serde(default)]
+    pub include_props: bool,
+    #[serde(default)]
+    pub custom_props: serde_json::Value,
 }
 
 impl ChatConfig {
@@ -88,6 +92,14 @@ impl ChatConfig {
         } else {
             // In a non-prefixing chat, do nothing (for now)
             message
+        }
+    }
+
+    pub fn props(&self) -> serde_json::Value {
+        if !self.custom_props.is_null() {
+            self.custom_props.clone()
+        } else {
+            json!({"is_clanker": true})
         }
     }
 }
@@ -409,7 +421,7 @@ impl Manager {
                     channel_id,
                     message: &text_message,
                     root_id: None,
-                    props: Some(json!({"is_clanker": true})),
+                    props: chat_config.include_props.then(|| chat_config.props()),
                 },
             )
             .await
