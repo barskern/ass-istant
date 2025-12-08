@@ -329,6 +329,7 @@ impl Manager {
             .min(max_deliberation_time);
 
         if chat_config.should_detect_natural_end {
+            debug!("starting to detect natural end..");
             let maybe_natural_end = cancel
                 .run_until_cancelled(self.impersonator.at_natural_end(chat_id, chat_config))
                 .await;

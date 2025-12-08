@@ -113,7 +113,19 @@ impl Impersonator {
         let mut history = history.lock().await;
         history.messages.extend(messages);
 
-        debug!("history is now: {history:?}");
+        if history.messages.len() > 1 {
+            let first = &history.messages[1];
+            let last = &history.messages[history.messages.len() - 1];
+            debug!(
+                first_role = ?first.role,
+                first_content = first.content,
+                last_role = ?last.role,
+                last_content = last.content,
+                "first and last history entries are now"
+            );
+        } else {
+            debug!("history is currently empty");
+        }
     }
 
     /// Ensure that histories are not too big, remove old cruft
