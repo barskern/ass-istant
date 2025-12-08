@@ -330,19 +330,19 @@ impl Manager {
 
         if chat_config.should_detect_natural_end {
             debug!("starting to detect natural end..");
-            let maybe_natural_end = cancel
-                .run_until_cancelled(self.impersonator.at_natural_end(chat_id, chat_config))
+            let maybe_warrants_reply = cancel
+                .run_until_cancelled(self.impersonator.warrants_reply(chat_id, chat_config))
                 .await;
 
-            let Some(natural_end) = maybe_natural_end else {
+            let Some(warrants_reply) = maybe_warrants_reply else {
                 return Ok(());
             };
 
-            if natural_end
-                .inspect_err(|e| warn!("failed to query if natural end: {e:?}"))
-                .unwrap_or(false)
+            if !warrants_reply
+                .inspect_err(|e| warn!("failed to for natural end: {e:?}"))
+                .unwrap_or(true)
             {
-                debug!("conversation at a natural end, not responding");
+                debug!("conversation does not warrant reply, stopping");
                 return Ok(());
             }
         }

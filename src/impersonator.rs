@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::iter;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ollama_rs::Ollama;
 use ollama_rs::generation::chat::request::ChatMessageRequest;
 use ollama_rs::generation::chat::{ChatMessage, MessageRole};
@@ -228,7 +228,7 @@ impl Impersonator {
         Ok(res.message)
     }
 
-    pub async fn at_natural_end(&self, chat_id: &str, _chat_config: &ChatConfig) -> Result<bool> {
+    pub async fn warrants_reply(&self, chat_id: &str, _chat_config: &ChatConfig) -> Result<bool> {
         let history = {
             let histories = self.histories.lock().await;
             match histories.get(chat_id).map(Arc::clone) {
@@ -239,8 +239,6 @@ impl Impersonator {
 
         let messages_to_eval = {
             let history = history.lock().await;
-            // TODO Prevent an expensive clone perhaps?
-            // Maybe ChatMessageRequest could use Arc<str> or &str instead?
             let mut max_assistant_msgs = 2u32;
 
             let rev_last_messages_index = history
@@ -263,18 +261,19 @@ impl Impersonator {
                 .saturating_sub(rev_last_messages_index.min(history.messages.len() - 1));
 
             if keep_last_messages_index < 1 {
-                warn!("got invalid keep last messages index");
-                return Ok(false);
+                return Err(anyhow!("got invalid keep last messages index"));
             }
 
             if let Some(last_messages) = history.messages.get(keep_last_messages_index..) {
                 iter::once(ChatMessage::system(
                     self.config.system_prompt_replier.clone(),
                 ))
+                // TODO Prevent an expensive clone perhaps?
+                // Maybe ChatMessageRequest could use Arc<str> or &str instead?
                 .chain(last_messages.iter().cloned())
                 .collect()
             } else {
-                return Ok(false);
+                return Err(anyhow!("failed to get last messages for reply query"));
             }
         };
 
@@ -297,10 +296,15 @@ impl Impersonator {
             "response from natural end detector"
         );
 
-        if res.message.content.contains("true") || res.message.content.contains("TRUE") {
+        if res.message.content.contains("false") || res.message.content.contains("FALSE") {
+            Ok(false)
+        } else if res.message.content.contains("true") || res.message.content.contains("TRUE") {
             Ok(true)
         } else {
-            Ok(false)
+            Err(anyhow!(
+                "response from replier detector did not return either true or false, but rather: {}",
+                res.message.content
+            ))
         }
     }
 
