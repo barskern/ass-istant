@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::iter;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -236,18 +237,49 @@ impl Impersonator {
             }
         };
 
-        let messages = {
+        let messages_to_eval = {
             let history = history.lock().await;
             // TODO Prevent an expensive clone perhaps?
             // Maybe ChatMessageRequest could use Arc<str> or &str instead?
-            let mut messages = history.messages.clone();
-            if let Some(first) = messages.first_mut() {
-                *first = ChatMessage::system(self.config.system_prompt_replier.clone());
+            let mut max_assistant_msgs = 2u32;
+
+            let rev_last_messages_index = history
+                .messages
+                .iter()
+                .rev()
+                .position(|m| match m.role {
+                    MessageRole::User => false,
+                    MessageRole::Assistant => {
+                        max_assistant_msgs = max_assistant_msgs.saturating_sub(1);
+                        max_assistant_msgs == 0
+                    }
+                    _ => true,
+                })
+                .unwrap_or(history.messages.len());
+
+            let keep_last_messages_index = history
+                .messages
+                .len()
+                .saturating_sub(rev_last_messages_index.min(history.messages.len() - 1));
+
+            if keep_last_messages_index < 1 {
+                warn!("got invalid keep last messages index");
+                return Ok(false);
             }
-            messages
+
+            if let Some(last_messages) = history.messages.get(keep_last_messages_index..) {
+                iter::once(ChatMessage::system(
+                    self.config.system_prompt_replier.clone(),
+                ))
+                .chain(last_messages.iter().cloned())
+                .collect()
+            } else {
+                return Ok(false);
+            }
         };
 
-        let request = ChatMessageRequest::new(self.config.model_name.clone(), messages)
+        debug!("asking for natural end of following messages: {messages_to_eval:?}");
+        let request = ChatMessageRequest::new(self.config.model_name.clone(), messages_to_eval)
             .options(self.model_options.clone())
             .keep_alive(KeepAlive::Until {
                 time: 5,
