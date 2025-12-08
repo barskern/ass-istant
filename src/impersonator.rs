@@ -231,6 +231,7 @@ You are working as a reformatter, turning generated sentences into a more human 
 You try your best to make the sentence sound natural, vocal and realistic.
 You may rewrite the sentences to give better flow to the content, especially removing punctuation, quotes and symbols.
 You may change leading characters to lowercase, add typos and skip trailing periods to make the messages more realistic.
+You do not change the capitalization of abbreviations, and you do NOT change banter, play on words and specific phrasings.
 You will always receive a single message, and you will reply with ONLY the reformatted message.
 "#.into()
 }
