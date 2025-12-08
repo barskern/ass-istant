@@ -8,7 +8,7 @@ use dashmap::DashMap;
 use futures::TryFutureExt;
 use mattermost_api::prelude::*;
 use ollama_rs::generation::chat::ChatMessage;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -106,6 +106,16 @@ struct PostEvent {
     sender_name: String,
     #[serde(rename = "post", with = "serde_nested_json")]
     content: Post,
+}
+
+#[derive(Serialize, Debug)]
+struct NewPostRequest<'a> {
+    pub channel_id: &'a str,
+    pub message: &'a str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_id: Option<&'a str>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub props: Option<serde_json::Value>,
 }
 
 impl PostEvent {
@@ -395,7 +405,12 @@ impl Manager {
             .post::<_, serde_json::Value>(
                 "posts",
                 None,
-                &json!({"channel_id": channel_id, "message": text_message}),
+                &NewPostRequest {
+                    channel_id,
+                    message: &text_message,
+                    root_id: None,
+                    props: Some(json!({"is_clanker": true})),
+                },
             )
             .await
             .context("sending chat message")?;
