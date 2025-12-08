@@ -43,9 +43,15 @@ impl Config {
         let has_cmd_prefix = post.message.starts_with(CMD_PREFIX);
         let from_me = post.user_id == self.my_user_id;
 
-        let is_injected_cmd = !chat_config.should_prefix && has_cmd_prefix;
-        let is_me_prefixed = chat_config.should_prefix && has_ai_prefix;
-        let is_me = (from_me && !is_injected_cmd) || is_me_prefixed;
+        let is_me = if chat_config.should_prefix {
+            // We are in a prefixed chat, all messages with AI prefix is me,
+            // all other messages are others
+            has_ai_prefix
+        } else {
+            // We are in a "normal" chat (non-prefixed), all messages from me without
+            // command prefix are me, all other messages are others
+            from_me && !has_cmd_prefix
+        };
 
         if is_me {
             Some(ChatRole::Me)
