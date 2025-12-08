@@ -23,6 +23,11 @@ use crate::utils::human_message_duration;
 const CMD_PREFIX: &str = "hey slave,";
 const AI_PREFIX: &str = "LLM: ";
 
+pub enum ChatRole {
+    Me,
+    Other,
+}
+
 #[derive(serde::Deserialize, Debug)]
 pub struct Config {
     // TODO Fetch from /users/me instead
@@ -30,11 +35,31 @@ pub struct Config {
     chats: HashMap<String, ChatConfig>,
 }
 
+impl Config {
+    pub fn determine_role(&self, post: &Post) -> Option<ChatRole> {
+        let chat_config = self.chats.get(&post.channel_id)?;
+
+        let has_ai_prefix = post.message.starts_with(AI_PREFIX);
+        let has_cmd_prefix = post.message.starts_with(CMD_PREFIX);
+        let from_me = post.user_id == self.my_user_id;
+
+        let is_injected_cmd = !chat_config.should_prefix && has_cmd_prefix;
+        let is_me_prefixed = chat_config.should_prefix && has_ai_prefix;
+        let is_me = (from_me && !is_injected_cmd) || is_me_prefixed;
+
+        if is_me {
+            Some(ChatRole::Me)
+        } else {
+            Some(ChatRole::Other)
+        }
+    }
+}
+
 #[derive(serde::Deserialize, Clone, Debug)]
-struct ChatConfig {
+pub struct ChatConfig {
     #[serde(default)]
-    should_prefix: bool,
-    friend_name: String,
+    pub should_prefix: bool,
+    pub friend_name: String,
 }
 
 impl ChatConfig {
@@ -48,10 +73,21 @@ impl ChatConfig {
             message.trim_start_matches(CMD_PREFIX).trim().to_string()
         }
     }
+
+    pub fn postprocess_message(&self, message: String) -> String {
+        let ChatConfig { should_prefix, .. } = self;
+        if *should_prefix {
+            // In a prefixing chat, we remove AI prefix before sending to the LLM
+            format!("{AI_PREFIX}{message}")
+        } else {
+            // In a non-prefixing chat, do nothing (for now)
+            message
+        }
+    }
 }
 
 #[derive(Deserialize, Debug)]
-struct PostContent {
+pub struct Post {
     message: String,
     user_id: String,
     channel_id: String,
@@ -59,14 +95,14 @@ struct PostContent {
 
 #[derive(Deserialize, Debug)]
 #[allow(unused)]
-struct PostMessage {
+struct PostEvent {
     channel_display_name: String,
     sender_name: String,
     #[serde(rename = "post", with = "serde_nested_json")]
-    content: PostContent,
+    content: Post,
 }
 
-impl PostMessage {
+impl PostEvent {
     pub fn chat_id(&self) -> &str {
         &self.content.channel_id
     }
@@ -75,7 +111,6 @@ impl PostMessage {
 #[derive(Default)]
 struct InflightState {
     cancel: CancellationToken,
-    messages: Vec<ChatMessage>,
 }
 
 #[derive(Clone)]
@@ -93,15 +128,9 @@ pub struct Manager {
 }
 
 #[derive(Deserialize, Debug)]
-pub struct PostForChannel {
-    user_id: String,
-    message: String,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct PostsForChannel {
+pub struct ChannelPostsResponse {
     order: Vec<String>,
-    posts: HashMap<String, PostForChannel>,
+    posts: HashMap<String, Post>,
 }
 
 impl Manager {
@@ -180,7 +209,7 @@ impl Manager {
     }
 
     async fn init_chat_histories(&self) {
-        let lookback_duration = Duration::from_secs(2 * 24 * 60 * 60);
+        let lookback_duration = Duration::from_secs(7 * 24 * 60 * 60);
         let since_unix_ms = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.saturating_sub(lookback_duration))
@@ -195,13 +224,12 @@ impl Manager {
                 let chat_config = chat_config.clone();
 
                 async move {
-                    let ChatConfig { friend_name, .. } = &chat_config;
                     let channel_id = &chat_id;
 
                     debug!(chat_id, "fetching chat posts...");
                     let Ok(mut res) = this
                         .api
-                        .query::<PostsForChannel>(
+                        .query::<ChannelPostsResponse>(
                             Method::GET.as_str(),
                             &format!("channels/{channel_id}/posts"),
                             Some(&[("since", &since_unix_ms.to_string())]),
@@ -218,24 +246,17 @@ impl Manager {
                         .iter()
                         .rev()
                         .filter_map(|post_id| res.posts.remove(post_id))
-                        .map(|m| {
-                            let has_ai_prefix = m.message.starts_with(AI_PREFIX);
-                            let has_cmd_prefix = m.message.starts_with(CMD_PREFIX);
-                            let from_me = m.user_id == this.config.my_user_id;
-
-                            let message = chat_config.preprocess_message(m.message);
-                            if (from_me && !chat_config.should_prefix && !has_cmd_prefix)
-                                || (has_ai_prefix && chat_config.should_prefix)
-                            {
-                                ChatMessage::assistant(message)
-                            } else {
-                                ChatMessage::user(message)
-                            }
+                        .filter_map(|m| {
+                            let message = chat_config.preprocess_message(m.message.clone());
+                            this.config.determine_role(&m).map(|r| match r {
+                                ChatRole::Me => ChatMessage::assistant(message),
+                                ChatRole::Other => ChatMessage::user(message),
+                            })
                         });
 
                     let history = this
                         .impersonator
-                        .new_blank_history(&chat_id, friend_name)
+                        .new_blank_history(&chat_id, &chat_config)
                         .chain(raw_message_history)
                         .collect();
 
@@ -246,49 +267,38 @@ impl Manager {
         chat_init_tasks.join_all().await;
     }
 
-    async fn respond_to_post_message(
-        &self,
-        post_message: PostMessage,
-        messages: Vec<ChatMessage>,
-        cancel: CancellationToken,
-    ) -> Result<()> {
-        let chat_id = post_message.chat_id().to_owned();
-        let PostMessage {
-            channel_display_name: _,
-            sender_name: _,
-            content:
-                PostContent {
-                    message: latest_message,
-                    user_id: _,
-                    channel_id,
-                },
-        } = post_message;
+    async fn maybe_respond_to_chat(&self, chat_id: &str, cancel: CancellationToken) -> Result<()> {
         let my_user_id = &self.config.my_user_id;
-
-        let Some(ChatConfig {
-            should_prefix,
-            friend_name,
-        }) = self.config.chats.get(&chat_id)
-        else {
-            return Err(anyhow!(
-                "did not find channel config for message: {latest_message:?}"
-            ));
+        let Some(chat_config) = self.config.chats.get(chat_id) else {
+            return Err(anyhow!("did not find chat config"));
         };
 
         // TODO Get this from user id (with channel config for DM perhaps?)
-        let channel_id = &channel_id;
+        let channel_id = chat_id;
 
         let start = Instant::now();
 
-        let latest_message = latest_message.trim().to_string();
-
-        // Just some heuristic to add some realism to the responses
+        // Just some heuristics to add some realism to the responses
         let write_chars_per_sec = 15.0;
         let read_chars_per_sec = 30.0;
-
-        let deliberation_time =
-            human_message_duration(&latest_message, read_chars_per_sec) + Duration::from_secs(5);
+        let max_answer_time = Duration::from_secs(3 * 60);
+        let max_deliberation_time = Duration::from_secs(3 * 60);
         let typing_notification_interval = Duration::from_secs(2);
+        let time_to_notice_message = Duration::from_secs(5); // Calculate based on time since previous message
+
+        // TODO Fix deliberation_time based on char length latest N messages from user
+        let unread_chars = self
+            .impersonator
+            .length_of_unanswered_messages(chat_id)
+            .await
+            // Some sensible default of some sort..
+            .unwrap_or(30);
+
+        let deliberation_time = (human_message_duration(unread_chars, read_chars_per_sec)
+            + time_to_notice_message)
+            .min(max_deliberation_time);
+
+        // TODO Decide if we should even generate a response (aka. ask an LLM if a response is warranted)
 
         let typing_cancel = CancellationToken::new();
         tokio::spawn({
@@ -296,7 +306,7 @@ impl Manager {
             let typing_cancel = typing_cancel.clone();
             let cancel = cancel.clone();
             let my_user_id = my_user_id.clone();
-            let channel_id = channel_id.clone();
+            let channel_id = channel_id.to_owned();
 
             cancel.run_until_cancelled_owned(async move {
                 // This makes us wait a bit before we send the typing notification
@@ -326,11 +336,7 @@ impl Manager {
         });
 
         let maybe_chat_response = cancel
-            .run_until_cancelled(self.impersonator.respond_to_messages(
-                &chat_id,
-                friend_name,
-                messages.clone(),
-            ))
+            .run_until_cancelled(self.impersonator.generate_a_response(chat_id, chat_config))
             .await;
 
         let Some(chat_response) = maybe_chat_response else {
@@ -341,8 +347,9 @@ impl Manager {
         let chat_response = chat_response.context("responding to messages")?;
 
         let elapsed = start.elapsed();
-        let answer_time =
-            deliberation_time + human_message_duration(&chat_response.content, write_chars_per_sec);
+        let answer_time = (deliberation_time
+            + human_message_duration(chat_response.content.len(), write_chars_per_sec))
+        .min(max_answer_time);
 
         let to_sleep = answer_time.saturating_sub(elapsed);
         if !to_sleep.is_zero() {
@@ -362,15 +369,10 @@ impl Manager {
             );
         }
 
-        let text_message = if *should_prefix {
-            format!("{AI_PREFIX}{}", &chat_response.content)
-        } else {
-            chat_response.content.clone()
-        };
-
+        let text_message = chat_config.postprocess_message(chat_response.content);
         // TODO The following three actions seem racy, ensure they work as intended..
         {
-            self.inflight_responses.remove(&chat_id);
+            self.inflight_responses.remove(chat_id);
         }
         // Normally cancel cannot happen after the inflight_state has been removed,
         // but if it does happen, it means that cancel was extracted before we were able to
@@ -388,117 +390,105 @@ impl Manager {
                 None,
                 &json!({"channel_id": channel_id, "message": text_message}),
             )
-            .await?;
-
-        // Only commit on successful send
-        let mut all_messages = messages;
-        all_messages.push(chat_response);
-        self.impersonator
-            .commit_to_history(&chat_id, all_messages)
-            .await;
+            .await
+            .context("sending chat message")?;
 
         Ok(())
     }
 
-    fn should_handle_post(&self, post_message: &PostMessage) -> bool {
-        let Some(chat_config) = self.config.chats.get(post_message.chat_id()) else {
-            return false;
-        };
-        if chat_config.should_prefix {
-            // In prefixing chats, answer all messages NOT starting with the AI prefix
-            !post_message.content.message.starts_with(AI_PREFIX)
-        } else {
-            // In non-prefixing chats, handle all messages (messages from "us" will only be
-            // added to the history, so that the "owner" and inject wanted messages)
-            true
-        }
-    }
-
-    fn process_post_message(&self, mut message: PostMessage) {
-        if self.should_handle_post(&message) {
-            debug!("processing message: {message:?}");
+    fn process_post_event(&self, mut event: PostEvent) {
+        if self.config.chats.contains_key(event.chat_id()) {
+            debug!("processing event: {event:?}");
             tokio::spawn({
                 let this = self.clone();
-                let chat_id = message.chat_id().to_owned();
-
+                let chat_id = event.chat_id().to_owned();
                 async move {
                     let Some(chat_config) = this.config.chats.get(&chat_id) else {
                         return;
                     };
-                    let has_cmd_prefix = message.content.message.starts_with(CMD_PREFIX);
-                    message.content.message =
-                        chat_config.preprocess_message(message.content.message);
 
-                    let is_from_me = message.content.user_id == this.config.my_user_id;
-                    if is_from_me && !chat_config.should_prefix && !has_cmd_prefix {
-                        // User injected a message into a non-prefixing chat, so we simply add it into the history as
-                        // a assistant message!
-
-                        // TODO How to separate injected messages from AI generated ones..
-
-                        //debug!("injecting assistant message: {:?}", message.content.message);
-                        //let injected_message = ChatMessage::assistant(message.content.message);
-                        //this.impersonator
-                        //    .commit_to_history(&chat_id, [injected_message])
-                        //    .await;
-
+                    let Some(chat_role) = this.config.determine_role(&event.content) else {
+                        warn!("failed to determine role of event: {event:?}");
                         return;
-                    }
-
-                    let chat_message = ChatMessage::user(message.content.message.clone());
-                    let messages = {
-                        if let Some((_, inflight_state)) = this.inflight_responses.remove(&chat_id)
-                        {
-                            // TODO Should we unconditionally cancel?? Verify that this works
-                            // even if we already finished and added to history..
-                            inflight_state.cancel.cancel();
-
-                            let mut messages = inflight_state.messages;
-                            messages.push(chat_message);
-                            messages
-                        } else {
-                            vec![chat_message]
-                        }
                     };
 
-                    let cancel = CancellationToken::new();
-                    {
-                        let existing = this.inflight_responses.insert(
-                            chat_id,
-                            InflightState {
-                                cancel: cancel.clone(),
-                                messages: messages.clone(),
-                            },
-                        );
-                        if let Some(existing) = existing {
-                            // This should not happen (I hope!)
-                            warn!(
-                                "when inserting inflight state, already existing found, cancelling it.."
+                    event.content.message = chat_config.preprocess_message(event.content.message);
+
+                    match chat_role {
+                        ChatRole::Me => {
+                            // We (or user) sent a message that should be added to the history
+                            // as an assistant message.
+                            debug!(
+                                "adding assistant message to history: {:?}",
+                                &event.content.message
                             );
-                            existing.cancel.cancel();
+
+                            let chat_message = ChatMessage::assistant(event.content.message);
+                            this.impersonator
+                                .commit_to_history(&chat_id, [chat_message])
+                                .await;
+                        }
+                        ChatRole::Other => {
+                            // Message was from the other user in the chat, so figure out how to respond
+
+                            debug!(
+                                "adding user message to history: {:?}",
+                                &event.content.message
+                            );
+
+                            if let Some((_, inflight_state)) =
+                                this.inflight_responses.remove(&chat_id)
+                            {
+                                // TODO Should we unconditionally cancel?? Verify that this works
+                                // even if we already finished and added to history..
+                                inflight_state.cancel.cancel();
+                            }
+                            // Push new message into the chat history
+                            {
+                                let chat_message = ChatMessage::user(event.content.message);
+                                this.impersonator
+                                    .commit_to_history(&chat_id, [chat_message])
+                                    .await;
+                            }
+
+                            let cancel = CancellationToken::new();
+                            {
+                                let existing = this.inflight_responses.insert(
+                                    chat_id.clone(),
+                                    InflightState {
+                                        cancel: cancel.clone(),
+                                    },
+                                );
+                                if let Some(existing) = existing {
+                                    // This should not happen (I hope!)
+                                    warn!(
+                                        "when inserting inflight state, already existing found, cancelling it.."
+                                    );
+                                    existing.cancel.cancel();
+                                }
+                            }
+
+                            if let Err(e) = this.maybe_respond_to_chat(&chat_id, cancel).await {
+                                error!("failed when handling maybe response: {e:?}")
+                            }
                         }
                     }
-
-                    let _ = this
-                        .respond_to_post_message(message, messages, cancel)
-                        .inspect_err(|e| warn!("failed to respond to post message: {e:?}"))
-                        .await;
                 }
             });
         } else {
-            debug!("skipping message: {message:?}");
+            trace!("skipping event: {event:?}");
         }
     }
 }
 
 #[async_trait::async_trait]
 impl WebsocketHandler for Manager {
-    async fn callback(&self, message: WebsocketEvent) {
+    async fn callback(&self, event: WebsocketEvent) {
         use mattermost_api::socket::WebsocketEventType::*;
 
         let mut log_full_msg = false;
 
-        match message.event {
+        match event.event {
             AddedToTeam => {}
             AuthenticationChallenge => {
                 warn!("got authentication challenge!");
@@ -517,9 +507,9 @@ impl WebsocketHandler for Manager {
             EphemeralMessage => {}
             GroupAdded => {}
             Hello => {
-                let server_version = message.data.get("server_version").and_then(|v| v.as_str());
-                let server_hostname = message.data.get("server_hostname").and_then(|v| v.as_str());
-                let connection_id = message.data.get("connection_id").and_then(|v| v.as_str());
+                let server_version = event.data.get("server_version").and_then(|v| v.as_str());
+                let server_hostname = event.data.get("server_hostname").and_then(|v| v.as_str());
+                let connection_id = event.data.get("connection_id").and_then(|v| v.as_str());
                 info!(
                     server_version,
                     server_hostname, connection_id, "got hello from server"
@@ -540,10 +530,10 @@ impl WebsocketHandler for Manager {
                 log_full_msg = true;
             }
             Posted => {
-                if let Ok(message) = serde_json::from_value::<PostMessage>(message.data.clone())
-                    .inspect_err(|e| warn!("failed to deserialize message data: {e:?}"))
+                if let Ok(event) = serde_json::from_value::<PostEvent>(event.data.clone())
+                    .inspect_err(|e| warn!("failed to deserialize event data: {e:?}"))
                 {
-                    self.process_post_message(message);
+                    self.process_post_event(event);
                 }
             }
             PreferenceChanged => {}
@@ -572,14 +562,14 @@ impl WebsocketHandler for Manager {
         };
 
         if log_full_msg {
-            if let Ok(ps) = serde_json::to_string_pretty(&message) {
-                debug!("got message: {}", ps);
+            if let Ok(ps) = serde_json::to_string_pretty(&event) {
+                debug!("got event: {}", ps);
             } else {
-                warn!("failed to serialized when logging message");
+                warn!("failed to serialize when logging event");
             }
         }
 
-        if let Err(e) = self.event_tx.try_send(message) {
+        if let Err(e) = self.event_tx.try_send(event) {
             warn!("failed to log event: {e:?}");
         }
     }

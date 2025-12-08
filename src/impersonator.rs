@@ -3,13 +3,15 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ollama_rs::Ollama;
-use ollama_rs::generation::chat::ChatMessage;
 use ollama_rs::generation::chat::request::ChatMessageRequest;
+use ollama_rs::generation::chat::{ChatMessage, MessageRole};
 use ollama_rs::generation::parameters::{KeepAlive, TimeUnit};
 use ollama_rs::models::ModelOptions;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{debug, instrument, trace, warn};
+
+use crate::chat_manager::ChatConfig;
 
 type SharedHistory = Arc<Mutex<Vec<ChatMessage>>>;
 
@@ -56,14 +58,30 @@ impl Impersonator {
     pub fn new_blank_history(
         &self,
         _chat_id: &str,
-        message_from_name: &str,
+        chat_config: &ChatConfig,
     ) -> impl Iterator<Item = ChatMessage> {
         [ChatMessage::system(
             self.config
                 .system_prompt_direct_message
-                .replace("{name}", message_from_name),
+                .replace("{name}", &chat_config.friend_name),
         )]
         .into_iter()
+    }
+
+    pub async fn length_of_unanswered_messages(&self, chat_id: &str) -> Option<usize> {
+        let history = {
+            let histories = self.histories.lock().await;
+            histories.get(chat_id).map(Arc::clone)?
+        };
+        let history = history.lock().await;
+        let n_chars = history
+            .iter()
+            .rev()
+            .take_while(|m| m.role == MessageRole::User)
+            .map(|m| m.content.len())
+            .sum();
+
+        Some(n_chars)
     }
 
     pub async fn commit_to_history(
@@ -71,13 +89,13 @@ impl Impersonator {
         chat_id: &str,
         messages: impl IntoIterator<Item = ChatMessage>,
     ) {
-        let histories = self.histories.lock().await;
-        let Some(history) = histories.get(chat_id).map(Arc::clone) else {
-            return;
+        let history = {
+            let histories = self.histories.lock().await;
+            let Some(history) = histories.get(chat_id).map(Arc::clone) else {
+                return;
+            };
+            history
         };
-
-        // NOTE! Do NOT hold locks across awaits!
-        drop(histories);
 
         let mut history = history.lock().await;
         history.extend(messages);
@@ -106,23 +124,23 @@ impl Impersonator {
         }
     }
 
-    // NOTE! Does NOT commit response to history!
-    pub async fn respond_to_messages(
+    /// Generate a chat response from the model based on the current chat history
+    ///
+    /// NOTE! Does NOT commit anything to the chat history!
+    pub async fn generate_a_response(
         &self,
         chat_id: &str,
-        message_from_name: &str,
-        messages: impl IntoIterator<Item = ChatMessage>,
+        chat_config: &ChatConfig,
     ) -> Result<ChatMessage> {
         let history = {
             let mut histories = self.histories.lock().await;
-
-            match histories.get(chat_id) {
-                Some(v) => Arc::clone(v),
+            match histories.get(chat_id).map(Arc::clone) {
+                Some(v) => v,
                 None => {
                     // Hopefully we don't hit this path, as we rather want the initialized
-                    // histories from previous chats (see `Handler::init_chat_histories`).
+                    // histories from previous chats (see `init_chat_history`).
                     let new = Arc::new(Mutex::new(
-                        self.new_blank_history(chat_id, message_from_name).collect(),
+                        self.new_blank_history(chat_id, chat_config).collect(),
                     ));
                     histories.insert(chat_id.into(), Arc::clone(&new));
                     new
@@ -132,12 +150,9 @@ impl Impersonator {
 
         let messages = {
             let history = history.lock().await;
-
-            history
-                .iter()
-                .cloned()
-                .chain(messages.into_iter())
-                .collect()
+            // TODO Prevent an expensive clone perhaps?
+            // Maybe ChatMessageRequest could use Arc<str> or &str instead?
+            history.clone()
         };
 
         let request = ChatMessageRequest::new(self.config.model_name.clone(), messages)
@@ -186,7 +201,7 @@ impl Impersonator {
     }
 
     async fn humanize_message(&self, message: &str) -> Result<String> {
-        debug!("message before humanization: {message}");
+        debug!(message, "message before humanization");
 
         let messages = vec![
             ChatMessage::system(self.config.system_prompt_humanizer.clone()),
@@ -206,7 +221,10 @@ impl Impersonator {
             .await
             .context("sending chat message to ollama")?;
 
-        debug!("message after humanization: {}", res.message.content);
+        debug!(
+            message = res.message.content.trim(),
+            "message after humanization"
+        );
 
         Ok(res.message.content.trim().to_string())
     }
