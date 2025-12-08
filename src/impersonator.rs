@@ -215,6 +215,51 @@ impl Impersonator {
         Ok(res.message)
     }
 
+    pub async fn at_natural_end(&self, chat_id: &str, _chat_config: &ChatConfig) -> Result<bool> {
+        let history = {
+            let histories = self.histories.lock().await;
+            match histories.get(chat_id).map(Arc::clone) {
+                Some(v) => v,
+                None => return Ok(true),
+            }
+        };
+
+        let messages = {
+            let history = history.lock().await;
+            // TODO Prevent an expensive clone perhaps?
+            // Maybe ChatMessageRequest could use Arc<str> or &str instead?
+            let mut messages = history.messages.clone();
+            if let Some(first) = messages.first_mut() {
+                *first = ChatMessage::system(self.config.system_prompt_replier.clone());
+            }
+            messages
+        };
+
+        let request = ChatMessageRequest::new(self.config.model_name.clone(), messages)
+            .options(self.model_options.clone())
+            .keep_alive(KeepAlive::Until {
+                time: 5,
+                unit: TimeUnit::Minutes,
+            });
+
+        let res = self
+            .client
+            .send_chat_messages(request)
+            .await
+            .context("sending chat message to ollama")?;
+
+        debug!(
+            msg = res.message.content.trim(),
+            "response from natural end detector"
+        );
+
+        if res.message.content.contains("true") || res.message.content.contains("TRUE") {
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     async fn humanize_message(&self, message: &str) -> Result<String> {
         debug!(msg = message, "message before humanization");
 
@@ -250,6 +295,8 @@ pub struct Config {
     pub system_prompt_direct_message: String,
     #[serde(default = "default_prompt_humanizer")]
     pub system_prompt_humanizer: String,
+    #[serde(default = "default_prompt_replier")]
+    pub system_prompt_replier: String,
     #[serde(default = "default_model_name")]
     pub model_name: String,
     #[serde(default = "default_max_chars_in_history")]
@@ -268,6 +315,15 @@ You may rewrite the sentences to give better flow to the content, especially rem
 You may change leading characters to lowercase, add typos and skip trailing periods to make the messages more realistic.
 You do not change the capitalization of abbreviations, and you do NOT change banter, play on words and specific phrasings.
 You will always receive a single message, and you will reply with ONLY the reformatted message.
+"#.into()
+}
+
+fn default_prompt_replier() -> String {
+    r#"
+You are an interpreter and conversation specialist, specializing in deciding whether to reply or not in a chat.
+The following conversation might be between multiple people.
+You are to determine if the conversation is at a natural end for your part, or if it warrants a further reply or question.
+You will reply with ONLY true if the conversation should continue or ONLY false if the conversation is at a natural end.
 "#.into()
 }
 

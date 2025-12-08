@@ -68,6 +68,8 @@ pub struct ChatConfig {
     pub friend_name: String,
     #[serde(default)]
     pub extra_props: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub should_detect_natural_end: bool,
 }
 
 impl ChatConfig {
@@ -326,7 +328,23 @@ impl Manager {
             + time_to_notice_message)
             .min(max_deliberation_time);
 
-        // TODO Decide if we should even generate a response (aka. ask an LLM if a response is warranted)
+        if chat_config.should_detect_natural_end {
+            let maybe_natural_end = cancel
+                .run_until_cancelled(self.impersonator.at_natural_end(chat_id, chat_config))
+                .await;
+
+            let Some(natural_end) = maybe_natural_end else {
+                return Ok(());
+            };
+
+            if natural_end
+                .inspect_err(|e| warn!("failed to query if natural end: {e:?}"))
+                .unwrap_or(false)
+            {
+                debug!("conversation at a natural end, not responding");
+                return Ok(());
+            }
+        }
 
         let typing_cancel = CancellationToken::new();
         tokio::spawn({
