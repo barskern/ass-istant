@@ -216,7 +216,7 @@ impl Impersonator {
     }
 
     async fn humanize_message(&self, message: &str) -> Result<String> {
-        debug!(?message, "message before humanization");
+        debug!(msg = message, "message before humanization");
 
         let messages = vec![
             ChatMessage::system(self.config.system_prompt_humanizer.clone()),
@@ -237,7 +237,7 @@ impl Impersonator {
             .context("sending chat message to ollama")?;
 
         debug!(
-            message = ?res.message.content.trim(),
+            msg = res.message.content.trim(),
             "message after humanization"
         );
 
