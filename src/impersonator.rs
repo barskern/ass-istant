@@ -13,7 +13,18 @@ use tracing::{debug, instrument, trace, warn};
 
 use crate::chat_manager::ChatConfig;
 
-type SharedHistory = Arc<Mutex<Vec<ChatMessage>>>;
+type SharedHistory = Arc<Mutex<ChatHistory>>;
+
+#[derive(Debug)]
+struct ChatHistory {
+    messages: Vec<ChatMessage>,
+}
+
+impl ChatHistory {
+    pub fn new(messages: Vec<ChatMessage>) -> Self {
+        Self { messages }
+    }
+}
 
 pub struct Impersonator {
     client: Ollama,
@@ -38,19 +49,21 @@ impl Impersonator {
         }
     }
 
-    pub async fn init_chat_history(&self, chat_id: &str, mut history: Vec<ChatMessage>) {
+    #[instrument(skip(self, messages))]
+    pub async fn init_chat_history(&self, chat_id: &str, mut messages: Vec<ChatMessage>) {
         let mut histories = self.histories.lock().await;
         if histories.contains_key(chat_id) {
             warn!("tried to init already existing chat history, skipping..");
             return;
         }
 
-        clean_history(
-            &mut history,
+        clean_history_messages(
+            &mut messages,
             self.config.max_chars_in_history,
             self.config.at_least_n_messages_in_history,
         );
 
+        let history = ChatHistory::new(messages);
         debug!("init history to: {:?}", &history);
         histories.insert(chat_id.to_owned(), Arc::new(Mutex::new(history)));
     }
@@ -75,6 +88,7 @@ impl Impersonator {
         };
         let history = history.lock().await;
         let n_chars = history
+            .messages
             .iter()
             .rev()
             .take_while(|m| m.role == MessageRole::User)
@@ -84,6 +98,7 @@ impl Impersonator {
         Some(n_chars)
     }
 
+    #[instrument(skip(self, messages))]
     pub async fn commit_to_history(
         &self,
         chat_id: &str,
@@ -98,7 +113,7 @@ impl Impersonator {
         };
 
         let mut history = history.lock().await;
-        history.extend(messages);
+        history.messages.extend(messages);
 
         debug!("history is now: {history:?}");
     }
@@ -115,8 +130,8 @@ impl Impersonator {
         for shared_history in shared_histories {
             {
                 let mut history = shared_history.lock().await;
-                clean_history(
-                    &mut history,
+                clean_history_messages(
+                    &mut history.messages,
                     self.config.max_chars_in_history,
                     self.config.at_least_n_messages_in_history,
                 );
@@ -127,6 +142,7 @@ impl Impersonator {
     /// Generate a chat response from the model based on the current chat history
     ///
     /// NOTE! Does NOT commit anything to the chat history!
+    #[instrument(skip(self, chat_config))]
     pub async fn generate_a_response(
         &self,
         chat_id: &str,
@@ -139,9 +155,9 @@ impl Impersonator {
                 None => {
                     // Hopefully we don't hit this path, as we rather want the initialized
                     // histories from previous chats (see `init_chat_history`).
-                    let new = Arc::new(Mutex::new(
+                    let new = Arc::new(Mutex::new(ChatHistory::new(
                         self.new_blank_history(chat_id, chat_config).collect(),
-                    ));
+                    )));
                     histories.insert(chat_id.into(), Arc::clone(&new));
                     new
                 }
@@ -152,7 +168,7 @@ impl Impersonator {
             let history = history.lock().await;
             // TODO Prevent an expensive clone perhaps?
             // Maybe ChatMessageRequest could use Arc<str> or &str instead?
-            history.clone()
+            history.messages.clone()
         };
 
         let request = ChatMessageRequest::new(self.config.model_name.clone(), messages)
@@ -185,23 +201,25 @@ impl Impersonator {
             );
         }
 
-        let start_humanize = Instant::now();
-        res.message.content = self
-            .humanize_message(res.message.content.trim())
-            .await
-            .inspect_err(|e| warn!("failed to humanize message: {e:?}"))
-            .unwrap_or_else(|_| res.message.content.trim().to_string());
-        let humanize_duration = start_humanize.elapsed();
-        debug!(
-            "humanizer spent {}s to humanize",
-            humanize_duration.as_secs()
-        );
+        if !self.config.skip_humanize {
+            let start_humanize = Instant::now();
+            res.message.content = self
+                .humanize_message(res.message.content.trim())
+                .await
+                .inspect_err(|e| warn!("failed to humanize message: {e:?}"))
+                .unwrap_or_else(|_| res.message.content.trim().to_string());
+            let humanize_duration = start_humanize.elapsed();
+            debug!(
+                "humanizer spent {}s to humanize",
+                humanize_duration.as_secs()
+            );
+        }
 
         Ok(res.message)
     }
 
     async fn humanize_message(&self, message: &str) -> Result<String> {
-        debug!(message, "message before humanization");
+        debug!(?message, "message before humanization");
 
         let messages = vec![
             ChatMessage::system(self.config.system_prompt_humanizer.clone()),
@@ -222,7 +240,7 @@ impl Impersonator {
             .context("sending chat message to ollama")?;
 
         debug!(
-            message = res.message.content.trim(),
+            message = ?res.message.content.trim(),
             "message after humanization"
         );
 
@@ -241,6 +259,8 @@ pub struct Config {
     pub max_chars_in_history: usize,
     #[serde(default = "default_at_least_n_messages_in_history")]
     pub at_least_n_messages_in_history: usize,
+    #[serde(default)]
+    pub skip_humanize: bool,
 }
 
 fn default_prompt_humanizer() -> String {
@@ -267,7 +287,7 @@ fn default_at_least_n_messages_in_history() -> usize {
 }
 
 #[instrument(level = "trace", skip(history))]
-fn clean_history(
+fn clean_history_messages(
     history: &mut Vec<ChatMessage>,
     max_chars_in_history: usize,
     at_least_n_messages: usize,
