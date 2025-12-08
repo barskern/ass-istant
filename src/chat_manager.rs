@@ -67,9 +67,7 @@ pub struct ChatConfig {
     pub should_prefix: bool,
     pub friend_name: String,
     #[serde(default)]
-    pub include_props: bool,
-    #[serde(default)]
-    pub custom_props: serde_json::Value,
+    pub extra_props: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl ChatConfig {
@@ -96,19 +94,20 @@ impl ChatConfig {
     }
 
     pub fn props(&self) -> serde_json::Value {
-        if !self.custom_props.is_null() {
-            self.custom_props.clone()
-        } else {
-            json!({"is_clanker": true})
-        }
+        let mut map = self.extra_props.as_ref().cloned().unwrap_or_default();
+        map.insert("is_clanker".into(), json!(true));
+        serde_json::Value::Object(map)
     }
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(unused)]
 pub struct Post {
     message: String,
     user_id: String,
     channel_id: String,
+    #[serde(default)]
+    props: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -274,6 +273,7 @@ impl Manager {
                         .iter()
                         .rev()
                         .filter_map(|post_id| res.posts.remove(post_id))
+                        .inspect(|m| trace!(?m, "got matter post"))
                         .filter_map(|m| {
                             let message = chat_config.preprocess_message(m.message.clone());
                             this.config.determine_role(&m).map(|r| match r {
@@ -311,7 +311,7 @@ impl Manager {
         let read_chars_per_sec = 30.0;
         let max_answer_time = Duration::from_secs(3 * 60);
         let max_deliberation_time = Duration::from_secs(3 * 60);
-        let typing_notification_interval = Duration::from_secs(2);
+        let typing_notification_interval = Duration::from_secs(4);
         let time_to_notice_message = Duration::from_secs(5); // Calculate based on time since previous message
 
         // TODO Fix deliberation_time based on char length latest N messages from user
@@ -421,7 +421,7 @@ impl Manager {
                     channel_id,
                     message: &text_message,
                     root_id: None,
-                    props: chat_config.include_props.then(|| chat_config.props()),
+                    props: Some(chat_config.props()),
                 },
             )
             .await
