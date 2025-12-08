@@ -15,7 +15,7 @@ use tokio::task::JoinSet;
 use tokio::time::{self, Instant};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
 use crate::impersonator::Impersonator;
 use crate::utils::human_message_duration;
@@ -404,12 +404,18 @@ impl Manager {
     }
 
     fn process_post_event(&self, mut event: PostEvent) {
-        if self.config.chats.contains_key(event.chat_id()) {
+        if let Some(chat_config) = self.config.chats.get(event.chat_id()) {
             debug!("processing event: {event:?}");
             tokio::spawn({
                 let this = self.clone();
                 let chat_id = event.chat_id().to_owned();
+                let channel_name = &event.channel_display_name;
+                let sender_name = &event.sender_name;
+                let friend_name = &chat_config.friend_name;
+                let chat_span = info_span!("chat", chat_id, channel_name, sender_name, friend_name);
+
                 async move {
+                    // We have to fetch chat_config again due to lifetimes
                     let Some(chat_config) = this.config.chats.get(&chat_id) else {
                         return;
                     };
@@ -480,7 +486,7 @@ impl Manager {
                             }
                         }
                     }
-                }
+                }.instrument(chat_span)
             });
         } else {
             trace!("skipping event: {event:?}");

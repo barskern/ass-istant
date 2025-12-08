@@ -49,7 +49,6 @@ impl Impersonator {
         }
     }
 
-    #[instrument(skip(self, messages))]
     pub async fn init_chat_history(&self, chat_id: &str, mut messages: Vec<ChatMessage>) {
         let mut histories = self.histories.lock().await;
         if histories.contains_key(chat_id) {
@@ -98,7 +97,6 @@ impl Impersonator {
         Some(n_chars)
     }
 
-    #[instrument(skip(self, messages))]
     pub async fn commit_to_history(
         &self,
         chat_id: &str,
@@ -142,7 +140,6 @@ impl Impersonator {
     /// Generate a chat response from the model based on the current chat history
     ///
     /// NOTE! Does NOT commit anything to the chat history!
-    #[instrument(skip(self, chat_config))]
     pub async fn generate_a_response(
         &self,
         chat_id: &str,
