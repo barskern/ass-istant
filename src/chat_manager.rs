@@ -70,6 +70,8 @@ pub struct ChatConfig {
     pub extra_props: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub should_detect_natural_end: bool,
+    #[serde(default)]
+    pub custom_system_prompt: Option<String>,
 }
 
 impl ChatConfig {

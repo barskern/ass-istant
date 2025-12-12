@@ -74,9 +74,15 @@ impl Impersonator {
         chat_config: &ChatConfig,
     ) -> impl Iterator<Item = ChatMessage> {
         [ChatMessage::system(
-            self.config
-                .system_prompt_direct_message
-                .replace("{name}", &chat_config.friend_name),
+            chat_config
+                .custom_system_prompt
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| {
+                    self.config
+                        .system_prompt_direct_message
+                        .replace("{friend_name}", &chat_config.friend_name)
+                }),
         )]
         .into_iter()
     }
