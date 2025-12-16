@@ -1,14 +1,11 @@
 use anyhow::{Context, Result};
-use url::Url;
 
-use crate::{chat_manager, impersonator, oauth};
+use crate::{impersonator, platform::mattermost};
 
 #[derive(serde::Deserialize, Debug)]
 pub struct Config {
-    pub instance_url: Url,
-    pub oauth: oauth::Config,
     pub impersonator: impersonator::Config,
-    pub chat: chat_manager::Config,
+    pub mattermost: mattermost::Config,
 }
 
 impl Config {

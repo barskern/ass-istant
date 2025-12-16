@@ -12,20 +12,9 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{debug, instrument, trace, warn};
 
-use crate::chat_manager::ChatConfig;
-
 type SharedHistory = Arc<Mutex<ChatHistory>>;
 
-#[derive(Debug)]
-struct ChatHistory {
-    messages: Vec<ChatMessage>,
-}
-
-impl ChatHistory {
-    pub fn new(messages: Vec<ChatMessage>) -> Self {
-        Self { messages }
-    }
-}
+use crate::platform::{ChatConfig, ChatId, ChatIdRef};
 
 pub struct Impersonator {
     client: Ollama,
@@ -35,7 +24,7 @@ pub struct Impersonator {
     // Double mutex by design, as we want to allow modification to the map
     // while histories are "extracted" from it, however we only want one
     // chat request modifying a single history at a time.
-    histories: Mutex<HashMap<String, SharedHistory>>,
+    histories: Mutex<HashMap<ChatId, SharedHistory>>,
 }
 
 impl Impersonator {
@@ -50,27 +39,28 @@ impl Impersonator {
         }
     }
 
-    pub async fn init_chat_history(&self, chat_id: &str, mut messages: Vec<ChatMessage>) {
+    pub async fn init_chat_history(&self, chat_id: &ChatIdRef, messages: Vec<ChatMessage>) {
         let mut histories = self.histories.lock().await;
         if histories.contains_key(chat_id) {
             warn!("tried to init already existing chat history, skipping..");
             return;
         }
 
-        clean_history_messages(
-            &mut messages,
-            self.config.max_chars_in_history,
-            self.config.at_least_n_messages_in_history,
-        );
+        let Config {
+            max_chars_in_history,
+            at_least_n_messages_in_history,
+            ..
+        } = self.config;
+        let mut history = ChatHistory::new(messages);
+        history.clean(max_chars_in_history, at_least_n_messages_in_history);
 
-        let history = ChatHistory::new(messages);
         debug!("init history to: {:?}", &history);
         histories.insert(chat_id.to_owned(), Arc::new(Mutex::new(history)));
     }
 
     pub fn new_blank_history(
         &self,
-        _chat_id: &str,
+        _chat_id: &ChatIdRef,
         chat_config: &ChatConfig,
     ) -> impl Iterator<Item = ChatMessage> {
         [ChatMessage::system(
@@ -87,7 +77,7 @@ impl Impersonator {
         .into_iter()
     }
 
-    pub async fn length_of_unanswered_messages(&self, chat_id: &str) -> Option<usize> {
+    pub async fn length_of_unanswered_messages(&self, chat_id: &ChatIdRef) -> Option<usize> {
         let history = {
             let histories = self.histories.lock().await;
             histories.get(chat_id).map(Arc::clone)?
@@ -106,7 +96,7 @@ impl Impersonator {
 
     pub async fn commit_to_history(
         &self,
-        chat_id: &str,
+        chat_id: &ChatIdRef,
         messages: impl IntoIterator<Item = ChatMessage>,
     ) {
         let history = {
@@ -139,6 +129,12 @@ impl Impersonator {
     pub async fn clean_histories(&self) {
         debug!("cleaning history!");
 
+        let Config {
+            max_chars_in_history,
+            at_least_n_messages_in_history,
+            ..
+        } = self.config;
+
         let shared_histories: Vec<_> = {
             let histories = self.histories.lock().await;
             histories.values().map(Arc::clone).collect()
@@ -147,11 +143,7 @@ impl Impersonator {
         for shared_history in shared_histories {
             {
                 let mut history = shared_history.lock().await;
-                clean_history_messages(
-                    &mut history.messages,
-                    self.config.max_chars_in_history,
-                    self.config.at_least_n_messages_in_history,
-                );
+                history.clean(max_chars_in_history, at_least_n_messages_in_history);
             }
         }
     }
@@ -161,7 +153,7 @@ impl Impersonator {
     /// NOTE! Does NOT commit anything to the chat history!
     pub async fn generate_a_response(
         &self,
-        chat_id: &str,
+        chat_id: &ChatIdRef,
         chat_config: &ChatConfig,
     ) -> Result<ChatMessage> {
         let history = {
@@ -174,7 +166,7 @@ impl Impersonator {
                     let new = Arc::new(Mutex::new(ChatHistory::new(
                         self.new_blank_history(chat_id, chat_config).collect(),
                     )));
-                    histories.insert(chat_id.into(), Arc::clone(&new));
+                    histories.insert(chat_id.to_owned(), Arc::clone(&new));
                     new
                 }
             }
@@ -234,7 +226,11 @@ impl Impersonator {
         Ok(res.message)
     }
 
-    pub async fn warrants_reply(&self, chat_id: &str, _chat_config: &ChatConfig) -> Result<bool> {
+    pub async fn warrants_reply(
+        &self,
+        chat_id: &ChatIdRef,
+        _chat_config: &ChatConfig,
+    ) -> Result<bool> {
         let history = {
             let histories = self.histories.lock().await;
             match histories.get(chat_id).map(Arc::clone) {
@@ -382,7 +378,7 @@ You will reply with ONLY true if the conversation should continue or ONLY false 
 }
 
 fn default_model_name() -> String {
-    "gemma3:12b".into()
+    "gemma3:4b".into()
 }
 
 fn default_max_chars_in_history() -> usize {
@@ -393,37 +389,46 @@ fn default_at_least_n_messages_in_history() -> usize {
     8
 }
 
-#[instrument(level = "trace", skip(history))]
-fn clean_history_messages(
-    history: &mut Vec<ChatMessage>,
-    max_chars_in_history: usize,
-    at_least_n_messages: usize,
-) {
-    let rev_keep_from_index = history
-        .iter()
-        .rev()
-        .position({
-            let mut chars_seen = 0;
-            move |m| {
-                chars_seen += m.content.len();
-                chars_seen >= max_chars_in_history
-            }
-        })
-        .unwrap_or(history.len());
+#[derive(Debug)]
+struct ChatHistory {
+    messages: Vec<ChatMessage>,
+}
 
-    if rev_keep_from_index < at_least_n_messages {
-        trace!(rev_keep_from_index, "using at least n messages limit");
-    } else {
-        trace!(rev_keep_from_index, "using max char limit");
+impl ChatHistory {
+    pub fn new(messages: Vec<ChatMessage>) -> Self {
+        Self { messages }
     }
 
-    let keep_from_index = history
-        .len()
-        .saturating_sub(rev_keep_from_index.max(at_least_n_messages));
+    #[instrument(level = "trace", skip(self))]
+    pub fn clean(&mut self, max_chars_in_history: usize, at_least_n_messages: usize) {
+        let rev_keep_from_index = self
+            .messages
+            .iter()
+            .rev()
+            .position({
+                let mut chars_seen = 0;
+                move |m| {
+                    chars_seen += m.content.len();
+                    chars_seen >= max_chars_in_history
+                }
+            })
+            .unwrap_or(self.messages.len());
 
-    if keep_from_index > 1 {
-        trace!("tossing {} messages from history", keep_from_index - 1);
-        // We keep the first system prompt, but throw all other messages until our keep from index
-        history.drain(1..keep_from_index);
+        if rev_keep_from_index < at_least_n_messages {
+            trace!(rev_keep_from_index, "using at least n messages limit");
+        } else {
+            trace!(rev_keep_from_index, "using max char limit");
+        }
+
+        let keep_from_index = self
+            .messages
+            .len()
+            .saturating_sub(rev_keep_from_index.max(at_least_n_messages));
+
+        if keep_from_index > 1 {
+            trace!("tossing {} messages from history", keep_from_index - 1);
+            // We keep the first system prompt, but throw all other messages until our keep from index
+            self.messages.drain(1..keep_from_index);
+        }
     }
 }

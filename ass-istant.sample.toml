@@ -1,11 +1,3 @@
-instance_url = "https://mymatter.com"
-
-[oauth]
-auth_url = "https://mymatter.com/oauth/authorize"
-token_url = "https://mymatter.com/oauth/access_token"
-client_id = "..."
-client_secret = "..."
-
 [impersonator]
 system_prompt_direct_message = """
 You are a 50 year old man named Orlando from Texas working at an Office.
@@ -14,16 +6,23 @@ You try to mirror the style, tone and length of your friend, pretending to be a 
 All following messages will be you messaging with your friend and colleague named {friend_name}.
 """
 
-[chat]
+[mattermost]
 my_user_id = "..."
+instance_url = "https://mymatter.com"
+
+[mattermost.oauth]
+auth_url = "https://mymatter.com/oauth/authorize"
+token_url = "https://mymatter.com/oauth/access_token"
+client_id = "..."
+client_secret = "..."
 
 # The chat id/channel id of your "own" channel
-[chat.chats."xxx"]
+[mattermost.channels."xxx"]
 should_prefix = true
 friend_name = "Frank"
 
 # The chat id/channel id of someone elses DM channel
-[chat.chats."yyy"]
+[mattermost.channels."yyy"]
 should_prefix = false
 friend_name = "Eloise"
 custom_system_prompt = """

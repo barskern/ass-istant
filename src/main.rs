@@ -1,8 +1,8 @@
 use std::env;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use mattermost_api::prelude::*;
 use ollama_rs::Ollama;
 use tokio::{signal, time};
 use tokio_util::sync::CancellationToken;
@@ -10,15 +10,14 @@ use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use crate::chat_manager::Manager;
 use crate::config::Config;
 use crate::impersonator::Impersonator;
 
-pub mod chat_manager;
 pub mod config;
 pub mod event_logger;
 pub mod impersonator;
 pub mod oauth;
+pub mod platform;
 pub mod utils;
 
 #[tokio::main]
@@ -46,25 +45,15 @@ async fn main() -> Result<()> {
     let cancel = CancellationToken::new();
     tokio::spawn(cancel_on_shutdown(cancel.clone()));
 
-    let auth_manager = oauth::Manager::new(config.oauth);
-    tokio::spawn(auth_manager.background_task());
-
-    let access_token = auth_manager.access_token().await;
-    let auth = AuthenticationData::from_access_token(access_token.secret());
-
-    let mut api = Mattermost::new(config.instance_url, auth)
-        .context("failed to initialize mattermost api")?;
-    api.store_session_token()
+    let mattermost = platform::mattermost::init(config.mattermost)
         .await
-        .context("failed to store session token")?;
+        .context("failed to init mattermost platform")?;
 
-    let event_tx = event_logger::start_event_logger();
-    let impersonator = Impersonator::new(Ollama::default(), config.impersonator);
+    let impersonator = Arc::new(Impersonator::new(Ollama::default(), config.impersonator));
 
-    let handler = Manager::new(api.clone(), config.chat, impersonator, event_tx);
-    handler.init().await;
-
-    let background_tasks = handler.background_tasks(cancel.clone());
+    let platform = platform::Manager::new(mattermost, impersonator);
+    platform.init(cancel.clone()).await;
+    let background_tasks = platform.background_tasks(cancel.clone());
 
     // Wait for shutdown
     cancel.cancelled().await;
