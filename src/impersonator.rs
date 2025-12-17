@@ -97,15 +97,10 @@ impl Impersonator {
     pub async fn commit_to_history(
         &self,
         chat_id: &ChatIdRef,
+        chat_config: &ChatConfig,
         messages: impl IntoIterator<Item = ChatMessage>,
     ) {
-        let history = {
-            let histories = self.histories.lock().await;
-            let Some(history) = histories.get(chat_id).map(Arc::clone) else {
-                return;
-            };
-            history
-        };
+        let history = self.get_or_init_history(chat_id, chat_config).await;
 
         let mut history = history.lock().await;
         history.messages.extend(messages);
@@ -156,21 +151,7 @@ impl Impersonator {
         chat_id: &ChatIdRef,
         chat_config: &ChatConfig,
     ) -> Result<ChatMessage> {
-        let history = {
-            let mut histories = self.histories.lock().await;
-            match histories.get(chat_id).map(Arc::clone) {
-                Some(v) => v,
-                None => {
-                    // Hopefully we don't hit this path, as we rather want the initialized
-                    // histories from previous chats (see `init_chat_history`).
-                    let new = Arc::new(Mutex::new(ChatHistory::new(
-                        self.new_blank_history(chat_id, chat_config).collect(),
-                    )));
-                    histories.insert(chat_id.to_owned(), Arc::clone(&new));
-                    new
-                }
-            }
-        };
+        let history = self.get_or_init_history(chat_id, chat_config).await;
 
         let messages = {
             let history = history.lock().await;
@@ -337,6 +318,26 @@ impl Impersonator {
         );
 
         Ok(res.message.content.trim().to_string())
+    }
+
+    async fn get_or_init_history(
+        &self,
+        chat_id: &ChatIdRef,
+        chat_config: &ChatConfig,
+    ) -> Arc<Mutex<ChatHistory>> {
+        let mut histories = self.histories.lock().await;
+        match histories.get(chat_id).map(Arc::clone) {
+            Some(v) => v,
+            None => {
+                // Hopefully we don't hit this path, as we rather want the initialized
+                // histories from previous chats (see `init_chat_history`).
+                let new = Arc::new(Mutex::new(ChatHistory::new(
+                    self.new_blank_history(chat_id, chat_config).collect(),
+                )));
+                histories.insert(chat_id.to_owned(), Arc::clone(&new));
+                new
+            }
+        }
     }
 }
 

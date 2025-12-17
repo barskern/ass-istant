@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -5,10 +6,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use axum::{Form, Router, routing};
 use chrono::Utc;
 use oauth2::basic::{BasicClient, BasicTokenResponse};
-use oauth2::{AccessToken, EndpointNotSet, EndpointSet, TokenResponse, reqwest};
+use oauth2::{AccessToken, EndpointNotSet, EndpointSet, Scope, TokenResponse, reqwest};
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
     TokenUrl,
@@ -23,11 +25,11 @@ use url::Url;
 
 use crate::utils::waitable_lock::WaitableLock;
 
-const DEFAULT_TOKEN_CACHE_NAME: &str = "default.json";
-const CALLBACK_PATH: &str = "/oauth/callback";
+const CALLBACK_PATH: &str = "oauth/callback";
 
 #[derive(Clone, Debug)]
 pub struct Manager {
+    name: Arc<str>,
     config: Arc<Config>,
     token: Arc<WaitableLock<TokenWrapper>>,
     oauth_client:
@@ -36,8 +38,13 @@ pub struct Manager {
 }
 
 impl Manager {
-    pub fn new(config: Config) -> Self {
-        let redirect_url = RedirectUrl::from_url(config.external_url.join(CALLBACK_PATH).unwrap());
+    pub fn new(name: String, config: Config) -> Self {
+        let redirect_url = RedirectUrl::from_url(
+            config
+                .external_url
+                .join(&format!("/{name}/{CALLBACK_PATH}"))
+                .unwrap(),
+        );
 
         // Create an OAuth2 client by specifying the client ID, client secret, authorization URL and
         // token URL.
@@ -54,11 +61,16 @@ impl Manager {
             .expect("Client should build");
 
         Self {
+            name: name.into(),
             config: Arc::new(config),
             token: Default::default(),
             oauth_client,
             http_client,
         }
+    }
+
+    fn callback_path(&self) -> String {
+        format!("/{}/{CALLBACK_PATH}", self.name)
     }
 
     pub async fn access_token(&self) -> AccessToken {
@@ -154,7 +166,9 @@ impl Manager {
     }
 
     async fn read_from_cache(&self) -> Result<TokenWrapper> {
-        let token_cache_path = self.config.cache_dir.join(DEFAULT_TOKEN_CACHE_NAME);
+        let mut token_cache_path = self.config.cache_dir.join(&*self.name);
+        token_cache_path.set_extension("json");
+
         let contents = tokio::fs::read(&token_cache_path)
             .await
             .context("failed to open cache file for reading")?;
@@ -167,7 +181,9 @@ impl Manager {
             warn!("failed to create cache directories: {e:?}");
         }
 
-        let token_cache_path = self.config.cache_dir.join(DEFAULT_TOKEN_CACHE_NAME);
+        let mut token_cache_path = self.config.cache_dir.join(&*self.name);
+        token_cache_path.set_extension("json");
+
         let mut file_buf = File::create(&token_cache_path)
             .await
             .map(BufWriter::new)
@@ -210,6 +226,7 @@ impl Manager {
         let (auth_url, csrf_token) = self
             .oauth_client
             .authorize_url(CsrfToken::new_random)
+            .add_scopes(self.config.scopes.iter().cloned())
             .set_pkce_challenge(pkce_challenge)
             .url();
 
@@ -221,21 +238,57 @@ impl Manager {
         // Setup a temporary axum server to wait for the redirect and auth code
         let auth_code = {
             #[derive(serde::Deserialize, Debug)]
-            struct CallbackRequest {
-                code: AuthorizationCode,
-                state: CsrfToken,
+            #[serde(untagged)]
+            enum CallbackParams {
+                Valid {
+                    code: AuthorizationCode,
+                    state: CsrfToken,
+                },
+                Error {
+                    error: String,
+                    error_description: String,
+                    state: CsrfToken,
+                },
+            }
+
+            impl CallbackParams {
+                fn state(&self) -> &CsrfToken {
+                    match self {
+                        CallbackParams::Valid { state, .. }
+                        | CallbackParams::Error { state, .. } => state,
+                    }
+                }
             }
 
             let (sender, mut receiver) = channel(10);
             let router = Router::new().route(
-                CALLBACK_PATH,
-                routing::get(move |Form(req): Form<CallbackRequest>| async move {
-                    if req.state.secret() != csrf_token.secret() {
-                        return (StatusCode::UNAUTHORIZED, "Invalid callback state");
+                &self.callback_path(),
+                routing::get(move |Form(params): Form<CallbackParams>| async move {
+                    if params.state().secret() != csrf_token.secret() {
+                        return (StatusCode::UNAUTHORIZED, "Invalid callback state")
+                            .into_response();
                     }
 
-                    let _ = sender.send(req.code).await;
-                    (StatusCode::OK, "Bot is authorized!")
+                    match params {
+                        CallbackParams::Valid { code, .. } => {
+                            let _ = sender.send(code).await;
+                            (StatusCode::OK, "Bot is authorized!").into_response()
+                        }
+                        CallbackParams::Error {
+                            error,
+                            error_description,
+                            ..
+                        } => {
+                            error!("got error from oauth callback: {error} {error_description}");
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!(
+                                    "Got error from oauth callback: **{error}** {error_description}"
+                                ),
+                            )
+                                .into_response()
+                        }
+                    }
                 }),
             );
             let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 8080))
@@ -315,6 +368,8 @@ pub struct Config {
     pub token_refresh_error_backoff: Duration,
     #[serde(default = "default_external_url")]
     pub external_url: Url,
+    #[serde(default)]
+    pub scopes: HashSet<Scope>,
 
     pub auth_url: AuthUrl,
     pub token_url: TokenUrl,

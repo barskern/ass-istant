@@ -13,10 +13,10 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
+use crate::oauth;
 use crate::platform::{
     ChatConfig as CommonChatConfig, ChatEvent, ChatId, ChatIdRef, ChatMessage, ChatRole, Platform,
 };
@@ -27,12 +27,18 @@ pub fn new_chat_id(channel_id: &str) -> ChatId {
     ChatId::new(PLATFORM_NAME, channel_id)
 }
 
-pub async fn init(config: Config) -> Result<Manager> {
-    let auth_manager = crate::oauth::Manager::new(config.oauth);
-    // TODO Add some form of cancellation here
+pub async fn init(config: Config, cancel: CancellationToken) -> Result<Manager> {
+    let auth_manager = oauth::Manager::new(PLATFORM_NAME.into(), config.oauth);
+    // TODO Add some form of graceful cancellation for the bg task
     tokio::spawn(auth_manager.background_task());
 
-    let access_token = auth_manager.access_token().await;
+    let Some(access_token) = cancel
+        .run_until_cancelled(auth_manager.access_token())
+        .await
+    else {
+        return Err(anyhow!("cancelled while waiting for access_token"));
+    };
+
     let auth = AuthenticationData::from_access_token(access_token.secret());
 
     let mut api = Mattermost::new(config.instance_url, auth)
@@ -58,6 +64,29 @@ pub struct Manager {
 }
 
 impl Platform for Manager {
+    async fn run(&mut self, cancel: CancellationToken) -> Result<()> {
+        loop {
+            debug!("starting websocket event handler");
+            match cancel
+                .run_until_cancelled(self.api.clone().connect_to_websocket(self.clone()))
+                .await
+            {
+                Some(Err(e)) => {
+                    error!("failed while handling websocket: {e:?}");
+                }
+                Some(Ok(_)) => {
+                    info!("websocket gracefully shutdown");
+                }
+                None => break,
+            };
+
+            // Retry to run websocket connection every minute if failing..
+            time::sleep(Duration::from_secs(60)).await;
+        }
+
+        Ok(())
+    }
+
     fn attach_event_extractor(&self, sender_tx: mpsc::Sender<ChatEvent>) {
         if let Err(e) = self.sender_tx.set(sender_tx) {
             warn!("duplicate initialization of event extractor: {e:?}");
@@ -122,33 +151,6 @@ impl Platform for Manager {
     fn common_chat_config(&self, chat_id: &ChatIdRef) -> Option<&CommonChatConfig> {
         let channel_id = chat_id.sub_id();
         self.config.channels.get(channel_id).map(|c| &c.common)
-    }
-
-    fn spawn_background_tasks(&self, tasks: &TaskTracker, cancel: CancellationToken) {
-        tasks.spawn({
-            let this = self.clone();
-            let cancel = cancel.clone();
-            async move {
-                loop {
-                    debug!("starting websocket event handler");
-                    match cancel
-                        .run_until_cancelled(this.api.clone().connect_to_websocket(this.clone()))
-                        .await
-                    {
-                        Some(Err(e)) => {
-                            error!("failed while handling websocket: {e:?}");
-                        }
-                        Some(Ok(_)) => {
-                            info!("websocket gracefully shutdown");
-                        }
-                        None => break,
-                    };
-
-                    // Retry to run websocket connection every minute if failing..
-                    time::sleep(Duration::from_secs(60)).await;
-                }
-            }
-        });
     }
 
     async fn send_typing_status(&self, chat_id: &ChatIdRef) {

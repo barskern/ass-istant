@@ -1,11 +1,17 @@
 use anyhow::{Context, Result};
 
-use crate::{impersonator, platform::mattermost};
+use crate::{
+    impersonator,
+    platform::{discord, mattermost},
+};
 
 #[derive(serde::Deserialize, Debug)]
 pub struct Config {
     pub impersonator: impersonator::Config,
-    pub mattermost: mattermost::Config,
+    #[serde(default)]
+    pub mattermost: Option<mattermost::Config>,
+    #[serde(default)]
+    pub discord: Option<discord::Config>,
 }
 
 impl Config {

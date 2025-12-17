@@ -14,6 +14,7 @@ use tracing::{Instrument, debug, error, info_span, trace, warn};
 use crate::impersonator::Impersonator;
 use crate::utils::human_message_duration;
 
+pub mod discord;
 pub mod mattermost;
 
 pub use types::{ChatId, ChatIdRef};
@@ -22,6 +23,8 @@ const CMD_PREFIX: &str = "hey slave,";
 const AI_PREFIX: &str = "LLM: ";
 
 pub trait Platform: Clone {
+    fn run(&mut self, cancel: CancellationToken) -> impl Future<Output = Result<()>> + Send;
+
     fn attach_event_extractor(&self, sender_tx: mpsc::Sender<ChatEvent>);
 
     fn common_chat_config(&self, chat_id: &ChatIdRef) -> Option<&ChatConfig>;
@@ -29,8 +32,6 @@ pub trait Platform: Clone {
     fn fetch_chat_histories(
         &self,
     ) -> impl Stream<Item = Result<(ChatId, Vec<OllamaChatMessage>)>> + Send;
-
-    fn spawn_background_tasks(&self, tasks: &TaskTracker, cancel: CancellationToken);
 
     fn send_typing_status(&self, chat_id: &ChatIdRef) -> impl Future<Output = ()> + Send;
     fn send_message(
@@ -72,7 +73,7 @@ impl<M: Platform> Manager<M> {
 }
 
 impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
-    pub async fn init(&self, cancel: CancellationToken) {
+    pub async fn run(&mut self, cancel: CancellationToken) {
         let tasks = TaskTracker::new();
 
         tasks.spawn({
@@ -112,14 +113,6 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
             })
         });
 
-        tasks.close();
-        tasks.wait().await;
-    }
-
-    // impl return to ensure the returned future doesn't reference Self by mistake
-    pub fn background_tasks(&self, cancel: CancellationToken) -> impl Future<Output = ()> + use<M> {
-        let tasks = TaskTracker::new();
-
         tasks.spawn({
             let this = self.clone();
             let cancel = cancel.clone();
@@ -152,11 +145,13 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
                 }
             })
         });
-
-        self.inner.spawn_background_tasks(&tasks, cancel.clone());
-
         tasks.close();
-        async move { tasks.wait().await }
+
+        if let Err(e) = self.inner.run(cancel.clone()).await {
+            error!("failed while running platform: {e:?}");
+        }
+
+        tasks.wait().await
     }
 
     async fn maybe_respond_to_chat(
@@ -325,7 +320,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
 
                                 let chat_message = OllamaChatMessage::assistant(content.message);
                                 this.impersonator
-                                    .commit_to_history(chat_id.as_ref(), [chat_message])
+                                    .commit_to_history(chat_id.as_ref(), chat_config, [chat_message])
                                     .await;
                             }
                             ChatRole::Other => {
@@ -347,7 +342,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
                                 {
                                     let chat_message = OllamaChatMessage::user(content.message);
                                     this.impersonator
-                                        .commit_to_history(chat_id.as_ref(), [chat_message])
+                                        .commit_to_history(chat_id.as_ref(), chat_config, [chat_message])
                                         .await;
                                 }
 

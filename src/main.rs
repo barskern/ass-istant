@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use ollama_rs::Ollama;
 use tokio::{signal, time};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -45,21 +46,53 @@ async fn main() -> Result<()> {
     let cancel = CancellationToken::new();
     tokio::spawn(cancel_on_shutdown(cancel.clone()));
 
-    let mattermost = platform::mattermost::init(config.mattermost)
-        .await
-        .context("failed to init mattermost platform")?;
-
     let impersonator = Arc::new(Impersonator::new(Ollama::default(), config.impersonator));
+    let platforms = TaskTracker::new();
 
-    let platform = platform::Manager::new(mattermost, impersonator);
-    platform.init(cancel.clone()).await;
-    let background_tasks = platform.background_tasks(cancel.clone());
+    if let Some(matter_config) = config.mattermost {
+        platforms.spawn({
+            let cancel = cancel.clone();
+            let impersonator = Arc::clone(&impersonator);
+            async move {
+                let Ok(mattermost) = platform::mattermost::init(matter_config, cancel.clone())
+                    .await
+                    .inspect_err(|e| error!("failed to init mattermost platform: {e:?}"))
+                else {
+                    return;
+                };
 
-    // Wait for shutdown
+                let mut platform = platform::Manager::new(mattermost, impersonator);
+                platform.run(cancel.clone()).await
+            }
+        });
+    }
+
+    if let Some(discord_config) = config.discord {
+        platforms.spawn({
+            let cancel = cancel.clone();
+            let impersonator = Arc::clone(&impersonator);
+            async move {
+                let Ok(discord) = platform::discord::init(discord_config, cancel.clone())
+                    .await
+                    .inspect_err(|e| error!("failed to init discord platform: {e:?}"))
+                else {
+                    return;
+                };
+
+                let mut platform = platform::Manager::new(discord, impersonator);
+                platform.run(cancel.clone()).await
+            }
+        });
+    }
+
+    platforms.close();
+
+    // Wait until shutdown is requested
     cancel.cancelled().await;
 
-    if let Err(e) = time::timeout(Duration::from_secs(3), background_tasks).await {
-        error!("timed out while waiting for background tasks to shutdown: {e:?}");
+    info!("waiting for platforms to gracefully shutdown...");
+    if let Err(e) = time::timeout(Duration::from_secs(3), platforms.wait()).await {
+        error!("timed out while waiting for platforms to shutdown: {e:?}");
     }
 
     Ok(())
