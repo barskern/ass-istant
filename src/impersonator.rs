@@ -224,7 +224,7 @@ impl Impersonator {
             let history = history.lock().await;
             let mut max_assistant_msgs = 2u32;
 
-            let rev_last_messages_index = history
+            let messages_to_keep = history
                 .messages
                 .iter()
                 .rev()
@@ -241,7 +241,7 @@ impl Impersonator {
             let keep_last_messages_index = history
                 .messages
                 .len()
-                .saturating_sub(rev_last_messages_index.min(history.messages.len() - 1));
+                .saturating_sub(messages_to_keep.min(history.messages.len() - 1));
 
             if keep_last_messages_index < 1 {
                 return Err(anyhow!("got invalid keep last messages index"));
@@ -402,7 +402,7 @@ impl ChatHistory {
 
     #[instrument(level = "trace", skip(self))]
     pub fn clean(&mut self, max_chars_in_history: usize, at_least_n_messages: usize) {
-        let rev_keep_from_index = self
+        let messages_to_keep = self
             .messages
             .iter()
             .rev()
@@ -415,16 +415,16 @@ impl ChatHistory {
             })
             .unwrap_or(self.messages.len());
 
-        if rev_keep_from_index < at_least_n_messages {
-            trace!(rev_keep_from_index, "using at least n messages limit");
+        if messages_to_keep < at_least_n_messages {
+            trace!(messages_to_keep, "using at least n messages limit");
         } else {
-            trace!(rev_keep_from_index, "using max char limit");
+            trace!(messages_to_keep, "using max char limit");
         }
 
         let keep_from_index = self
             .messages
             .len()
-            .saturating_sub(rev_keep_from_index.max(at_least_n_messages));
+            .saturating_sub(messages_to_keep.max(at_least_n_messages));
 
         if keep_from_index > 1 {
             trace!("tossing {} messages from history", keep_from_index - 1);
