@@ -22,7 +22,7 @@ pub use types::{ChatId, ChatIdRef};
 const CMD_PREFIX: &str = "hey slave,";
 const AI_PREFIX: &str = "LLM: ";
 
-pub trait Platform: Clone {
+pub trait Platform {
     fn run(&mut self, cancel: CancellationToken) -> impl Future<Output = Result<()>> + Send;
 
     fn attach_event_extractor(&self, sender_tx: mpsc::Sender<ChatEvent>);
