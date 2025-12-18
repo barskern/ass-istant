@@ -25,8 +25,6 @@ use url::Url;
 
 use crate::utils::waitable_lock::WaitableLock;
 
-const CALLBACK_PATH: &str = "oauth/callback";
-
 #[derive(Clone, Debug)]
 pub struct Manager {
     name: Arc<str>,
@@ -39,12 +37,8 @@ pub struct Manager {
 
 impl Manager {
     pub fn new(name: String, config: Config) -> Self {
-        let redirect_url = RedirectUrl::from_url(
-            config
-                .external_url
-                .join(&format!("/{name}/{CALLBACK_PATH}"))
-                .unwrap(),
-        );
+        let redirect_url =
+            RedirectUrl::from_url(config.external_url.join(&callback_path(&name)).unwrap());
 
         // Create an OAuth2 client by specifying the client ID, client secret, authorization URL and
         // token URL.
@@ -67,10 +61,6 @@ impl Manager {
             oauth_client,
             http_client,
         }
-    }
-
-    fn callback_path(&self) -> String {
-        format!("/{}/{CALLBACK_PATH}", self.name)
     }
 
     pub async fn access_token(&self) -> AccessToken {
@@ -262,7 +252,7 @@ impl Manager {
 
             let (sender, mut receiver) = channel(10);
             let router = Router::new().route(
-                &self.callback_path(),
+                &callback_path(&self.name),
                 routing::get(move |Form(params): Form<CallbackParams>| async move {
                     if params.state().secret() != csrf_token.secret() {
                         return (StatusCode::UNAUTHORIZED, "Invalid callback state")
@@ -393,4 +383,8 @@ fn default_token_grace_period() -> Duration {
 
 fn default_token_refresh_error_backoff() -> Duration {
     Duration::from_secs(30)
+}
+
+fn callback_path(name: &str) -> String {
+    format!("/{name}/oauth/callback")
 }
