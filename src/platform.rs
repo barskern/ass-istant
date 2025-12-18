@@ -6,10 +6,10 @@ use dashmap::DashMap;
 use futures::{Stream, StreamExt};
 use ollama_rs::generation::chat::ChatMessage as OllamaChatMessage;
 use tokio::sync::mpsc;
-use tokio::time::{self, Instant};
+use tokio::time::{Instant, sleep};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{Instrument, debug, error, info_span, trace, warn};
+use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
 use crate::impersonator::Impersonator;
 use crate::utils::human_message_duration;
@@ -50,6 +50,8 @@ pub struct Manager<M: Platform> {
     inner: M,
     impersonator: Arc<Impersonator>,
     inflight_responses: Arc<DashMap<ChatId, InflightState>>,
+    typing_tasks: TaskTracker,
+    processing_tasks: TaskTracker,
 }
 
 impl<M: Platform + Clone> Clone for Manager<M> {
@@ -58,6 +60,8 @@ impl<M: Platform + Clone> Clone for Manager<M> {
             inner: self.inner.clone(),
             impersonator: Arc::clone(&self.impersonator),
             inflight_responses: Arc::clone(&self.inflight_responses),
+            typing_tasks: self.typing_tasks.clone(),
+            processing_tasks: self.processing_tasks.clone(),
         }
     }
 }
@@ -68,6 +72,8 @@ impl<M: Platform> Manager<M> {
             inner,
             impersonator,
             inflight_responses: Default::default(),
+            typing_tasks: TaskTracker::new(),
+            processing_tasks: TaskTracker::new(),
         }
     }
 }
@@ -127,7 +133,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
 
             cancel.run_until_cancelled_owned(async move {
                 loop {
-                    time::sleep(clean_history_interval).await;
+                    sleep(clean_history_interval).await;
                     this.impersonator.clean_histories().await;
                 }
             })
@@ -152,13 +158,26 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
                 }
             })
         });
-        tasks.close();
 
         if let Err(e) = self.inner.run(cancel.clone()).await {
             error!("failed while running platform: {e:?}");
         }
 
-        tasks.wait().await
+        let n_inflight_responses = self.inflight_responses.len();
+        if n_inflight_responses > 0 {
+            info!("had {n_inflight_responses} inflight response(s) on shutdown, cancelling...");
+            for elem in self.inflight_responses.iter() {
+                elem.cancel.cancel();
+            }
+            self.inflight_responses.clear();
+        }
+
+        tasks.close();
+        tasks.wait().await;
+        self.typing_tasks.close();
+        self.typing_tasks.wait().await;
+        self.processing_tasks.close();
+        self.processing_tasks.wait().await;
     }
 
     async fn maybe_respond_to_chat(
@@ -212,19 +231,19 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
         }
 
         let typing_cancel = cancel.child_token();
-        tokio::spawn({
+        self.typing_tasks.spawn({
             let this = self.clone();
             let typing_cancel = typing_cancel.clone();
             let chat_id = chat_id.to_owned();
 
             typing_cancel.run_until_cancelled_owned(async move {
-                time::sleep(deliberation_time).await;
+                sleep(deliberation_time).await;
                 loop {
                     trace!("sending typing notification...");
                     this.inner.send_typing_status(chat_id.as_ref()).await;
 
                     // TODO Add some noise to make it more realistic?
-                    time::sleep(typing_notification_interval).await;
+                    sleep(typing_notification_interval).await;
                 }
             })
         });
@@ -251,10 +270,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
             debug!(
                 "finished in {elapsed:?}, human answer time should be ish {answer_time:?}, so waiting a bit.."
             );
-            let Some(_) = cancel
-                .run_until_cancelled(tokio::time::sleep(to_sleep))
-                .await
-            else {
+            let Some(_) = cancel.run_until_cancelled(sleep(to_sleep)).await else {
                 debug!("cancelled while waiting to send answer, so cancelled sending...");
                 return Ok(());
             };
@@ -300,7 +316,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
                     return;
                 };
 
-                tokio::spawn({
+                self.processing_tasks.spawn({
                     let this = self.clone();
                     let chat_id = chat_id.to_owned();
                     let friend_name = &chat_config.friend_name;

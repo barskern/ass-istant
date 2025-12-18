@@ -13,6 +13,7 @@ use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
@@ -28,12 +29,17 @@ pub fn new_chat_id(channel_id: &str) -> ChatId {
 }
 
 pub async fn init(config: Config, cancel: CancellationToken) -> Result<Manager> {
-    let auth_manager = oauth::Manager::new(PLATFORM_NAME.into(), config.oauth);
-    // TODO Add some form of graceful cancellation for the bg task
-    tokio::spawn(auth_manager.background_task());
+    let background_tasks = TaskTracker::new();
+
+    let mut auth_manager = oauth::Manager::new(PLATFORM_NAME.into(), config.oauth);
+    let token_handle = auth_manager.token_handle();
+    background_tasks.spawn({
+        let cancel = cancel.clone();
+        async move { auth_manager.run(cancel).await }
+    });
 
     let Some(access_token) = cancel
-        .run_until_cancelled(auth_manager.access_token())
+        .run_until_cancelled(token_handle.access_token())
         .await
     else {
         return Err(anyhow!("cancelled while waiting for access_token"));
@@ -52,6 +58,7 @@ pub async fn init(config: Config, cancel: CancellationToken) -> Result<Manager> 
         api,
         config: Arc::new(config.chats),
         sender_tx: Arc::new(OnceLock::new()),
+        background_tasks,
     })
 }
 
@@ -59,8 +66,8 @@ pub async fn init(config: Config, cancel: CancellationToken) -> Result<Manager> 
 pub struct Manager {
     api: Mattermost,
     config: Arc<ChatsConfig>,
-
     sender_tx: Arc<OnceLock<mpsc::Sender<ChatEvent>>>,
+    background_tasks: TaskTracker,
 }
 
 impl Platform for Manager {
@@ -77,12 +84,16 @@ impl Platform for Manager {
                 Some(Ok(_)) => {
                     info!("websocket gracefully shutdown");
                 }
+                // Cancelled!
                 None => break,
             };
 
             // Retry to run websocket connection every minute if failing..
             time::sleep(Duration::from_secs(60)).await;
         }
+
+        self.background_tasks.close();
+        self.background_tasks.wait().await;
 
         Ok(())
     }

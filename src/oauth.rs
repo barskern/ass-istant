@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::BufWriter;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,15 +16,33 @@ use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
     TokenUrl,
 };
-use tokio::fs::{File, create_dir_all};
-use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc::channel;
+use tokio::sync::mpsc;
+use tokio::task;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tokio_util::task::TaskTracker;
+use tracing::{debug, error, info, info_span, trace, warn};
 use url::Url;
 
 use crate::utils::waitable_lock::WaitableLock;
+
+#[derive(Clone, Debug)]
+pub struct TokenHandle {
+    token: Arc<WaitableLock<TokenWrapper>>,
+}
+
+impl TokenHandle {
+    pub async fn access_token(&self) -> AccessToken {
+        self.token
+            .fetch_or_wait()
+            .await
+            // TODO Is this unwrap merited??
+            .unwrap()
+            .response
+            .access_token()
+            .clone()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Manager {
@@ -33,6 +52,7 @@ pub struct Manager {
     oauth_client:
         BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>,
     http_client: reqwest::Client,
+    cache_write_tasks: TaskTracker,
 }
 
 impl Manager {
@@ -60,83 +80,83 @@ impl Manager {
             token: Default::default(),
             oauth_client,
             http_client,
+            cache_write_tasks: TaskTracker::new(),
         }
     }
 
-    pub async fn access_token(&self) -> AccessToken {
-        self.token
-            .fetch_or_wait()
-            .await
-            .unwrap()
-            .response
-            .access_token()
-            .clone()
+    pub fn token_handle(&self) -> TokenHandle {
+        TokenHandle {
+            token: Arc::clone(&self.token),
+        }
     }
 
-    // TODO Make this cancel safe!
-    pub fn background_task(&self) -> impl Future<Output = ()> + use<> {
-        let this = self.clone();
-
-        async move {
-            match this.read_from_cache().await {
-                Ok(cached_token) => {
-                    let grace_expires_at =
-                        cached_token.expires_at() - this.config.token_grace_period;
-
-                    let until_refresh = (grace_expires_at - Utc::now())
-                        .to_std()
-                        .unwrap_or(Duration::ZERO);
-
-                    debug!(?cached_token, ?until_refresh, "cached token info");
-
-                    if !until_refresh.is_zero() {
-                        this.token.write(cached_token).await;
-                        tokio::time::sleep(until_refresh).await;
-                    } else {
-                        info!("cached token was fully expired or in grace period");
-                    }
-                }
-                Err(e) => {
-                    warn!("failed to fetch token from cache: {e:?}");
-                }
-            }
-
-            loop {
-                match this.update_token().await {
-                    Ok(new_token) => {
+    pub async fn run(&mut self, cancel: CancellationToken) {
+        // TODO Verify that this is cancel safe
+        cancel
+            .run_until_cancelled_owned(async {
+                match self.read_from_cache().await {
+                    Ok(cached_token) => {
                         let grace_expires_at =
-                            new_token.expires_at() - this.config.token_grace_period;
+                            cached_token.expires_at() - self.config.token_grace_period;
 
                         let until_refresh = (grace_expires_at - Utc::now())
                             .to_std()
                             .unwrap_or(Duration::ZERO);
 
-                        if until_refresh.is_zero() {
-                            error!("new token is not valid for more than configured grace period!");
-                            tokio::time::sleep(this.config.token_refresh_error_backoff).await;
-                        } else {
-                            this.token.write(new_token.clone()).await;
+                        debug!(?cached_token, ?until_refresh, "cached token info");
 
-                            // TODO Ratelimit this spawning..
-                            tokio::spawn({
-                                let this = this.clone();
-                                let new_token = new_token.clone();
-                                async move {
-                                    if let Err(e) = this.write_to_cache(new_token).await {
-                                        warn!("failed to write to cache: {e:?}");
-                                    }
-                                }
-                            });
+                        if !until_refresh.is_zero() {
+                            self.token.write(cached_token).await;
                             tokio::time::sleep(until_refresh).await;
+                        } else {
+                            info!("cached token was fully expired or in grace period");
                         }
                     }
                     Err(e) => {
-                        error!("failed to update token: {e:?}");
-                        tokio::time::sleep(this.config.token_refresh_error_backoff).await;
+                        warn!("failed to fetch token from cache: {e:?}");
                     }
                 }
-            }
-        }
+
+                loop {
+                    match self.update_token().await {
+                        Ok(new_token) => {
+                            let grace_expires_at =
+                                new_token.expires_at() - self.config.token_grace_period;
+
+                            let until_refresh = (grace_expires_at - Utc::now())
+                                .to_std()
+                                .unwrap_or(Duration::ZERO);
+
+                            if until_refresh.is_zero() {
+                                error!(
+                                    "new token is not valid for more than configured grace period!"
+                                );
+                                tokio::time::sleep(self.config.token_refresh_error_backoff).await;
+                            } else {
+                                self.token.write(new_token.clone()).await;
+                                self.cache_write_tasks.spawn({
+                                    let this = self.clone();
+                                    let new_token = new_token.clone();
+                                    async move {
+                                        if let Err(e) = this.write_to_cache(new_token).await {
+                                            warn!("failed to write token to cache: {e:?}");
+                                        }
+                                    }
+                                });
+                                tokio::time::sleep(until_refresh).await;
+                            }
+                        }
+                        Err(e) => {
+                            error!("failed to update token: {e:?}");
+                            tokio::time::sleep(self.config.token_refresh_error_backoff).await;
+                        }
+                    }
+                }
+            })
+            .await;
+
+        self.cache_write_tasks.close();
+        self.cache_write_tasks.wait().await;
     }
 
     async fn update_token(&self) -> Result<TokenWrapper> {
@@ -161,34 +181,65 @@ impl Manager {
 
         let contents = tokio::fs::read(&token_cache_path)
             .await
-            .context("failed to open cache file for reading")?;
+            .context("failed to open token cache file for reading")?;
 
         serde_json::from_slice(&contents).context("failed to parse token cache")
     }
 
+    /// # Cancel Safety
+    ///
+    /// If cancelled, either the token was successfully written to file, or it
+    /// has not been written at all.
     async fn write_to_cache(&self, token: TokenWrapper) -> Result<()> {
-        if let Err(e) = create_dir_all(&self.config.cache_dir).await {
-            warn!("failed to create cache directories: {e:?}");
-        }
+        let cache_dir = self.config.cache_dir.clone();
 
-        let mut token_cache_path = self.config.cache_dir.join(&*self.name);
+        let mut token_cache_path = cache_dir.join(&*self.name);
         token_cache_path.set_extension("json");
 
-        let mut file_buf = File::create(&token_cache_path)
-            .await
-            .map(BufWriter::new)
-            .context("failed to open cache file for writing")?;
+        let mut token_cache_lock = token_cache_path.clone();
+        token_cache_lock.set_extension("lock");
 
-        let bytes = serde_json::to_vec(&token).context("failed to serialize json")?;
+        // NOTE! Important that we write the temporary file to the same
+        // file system as the destination, or `rename` might not work!
+        let mut tmp_token_cache_path = token_cache_path.clone();
+        tmp_token_cache_path.set_extension("tmp.json");
 
-        file_buf
-            .write_all(&bytes)
-            .await
-            .context("failed to write json buffer to cache file")?;
+        task::spawn_blocking(move || {
+            let span = info_span!("write_to_cache", ?token_cache_path);
+            let _ = span.enter();
 
-        file_buf.flush().await.context("failed to flush file")?;
+            if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+                warn!("failed to create cache directories: {e:?}");
+            }
 
-        Ok(())
+            // This should hopefully be resilient to both multiple iterations
+            // of this program running on the same computer, but also for multiple
+            // tasks in the same instance trying to update the same token cache.
+            let lockfile = std::fs::File::create_new(&token_cache_lock)
+                .inspect_err(|e| trace!("could not create new token lockfile: {e:?}"))
+                .or_else(|_| std::fs::File::open(&token_cache_lock))
+                .context("failed to open/create token lockfile")?;
+
+            // This ensures that only a single write_to_cache task can
+            // write to the temporary file at a time, even across processes
+            lockfile
+                .lock()
+                .context("failed to acquire token cache lock")?;
+
+            {
+                let file_buf = std::fs::File::create(&tmp_token_cache_path)
+                    .map(BufWriter::new)
+                    .context("failed to open cache file for writing")?;
+                serde_json::to_writer(file_buf, &token).context("failed to serialize json")?;
+            }
+
+            std::fs::rename(&tmp_token_cache_path, &token_cache_path)
+                .context("failed to rename temp token file")?;
+
+            Ok(())
+        })
+        .await
+        .context("failed to spawn blocking task")?
     }
 
     async fn refresh_token_flow(&self, token: TokenWrapper) -> Result<TokenWrapper> {
@@ -250,7 +301,7 @@ impl Manager {
                 }
             }
 
-            let (sender, mut receiver) = channel(10);
+            let (sender, mut receiver) = mpsc::channel(10);
             let router = Router::new().route(
                 &callback_path(&self.name),
                 routing::get(move |Form(params): Form<CallbackParams>| async move {
@@ -291,6 +342,7 @@ impl Manager {
                 let _ = axum::serve(listener, router)
                     .with_graceful_shutdown(cancel.cancelled_owned())
                     .await;
+                debug!("stopped oauth callback http server");
             });
 
             receiver

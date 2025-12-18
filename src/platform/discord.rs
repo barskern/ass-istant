@@ -13,8 +13,9 @@ use serenity::model::channel::Message;
 use serenity::model::gateway::Ready;
 use serenity::prelude::*;
 use tokio::sync::mpsc;
-use tokio::time;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, trace, warn};
 
 use crate::oauth;
@@ -36,17 +37,22 @@ pub fn new_chat_id(channel_id: &str) -> ChatId {
 }
 
 pub async fn init(config: Config, cancel: CancellationToken) -> Result<Manager> {
+    let background_tasks = TaskTracker::new();
+
     let mut oauth_config = config.oauth;
     oauth_config
         .scopes
         .extend(REQUIRED_SCOPES.iter().map(|&s| Scope::new(s.into())));
 
-    let auth_manager = oauth::Manager::new(PLATFORM_NAME.into(), oauth_config);
-    // TODO Add some form of cancellation to this bg task
-    tokio::spawn(auth_manager.background_task());
+    let mut auth_manager = oauth::Manager::new(PLATFORM_NAME.into(), oauth_config);
+    let token_handle = auth_manager.token_handle();
+    background_tasks.spawn({
+        let cancel = cancel.clone();
+        async move { auth_manager.run(cancel).await }
+    });
 
     let Some(access_token) = cancel
-        .run_until_cancelled(auth_manager.access_token())
+        .run_until_cancelled(token_handle.access_token())
         .await
     else {
         return Err(anyhow!("cancelled while waiting for access_token"));
@@ -62,12 +68,16 @@ pub async fn init(config: Config, cancel: CancellationToken) -> Result<Manager> 
         sender_tx: OnceLock::new(),
     });
 
-    Ok(Manager { handler })
+    Ok(Manager {
+        handler,
+        background_tasks,
+    })
 }
 
 #[derive(Clone)]
 pub struct Manager {
     handler: Arc<Handler>,
+    background_tasks: TaskTracker,
 }
 
 impl Platform for Manager {
@@ -98,8 +108,12 @@ impl Platform for Manager {
             };
 
             // Retry to run websocket connection every minute if failing..
-            time::sleep(Duration::from_secs(60)).await;
+            sleep(Duration::from_secs(60)).await;
         }
+
+        info!("awaiting background tasks for graceful shutdown..");
+        self.background_tasks.close();
+        self.background_tasks.wait().await;
 
         Ok(())
     }
