@@ -87,6 +87,12 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
                         let this = this.clone();
                         let impersonator = Arc::clone(&this.impersonator);
 
+                        let chat_id = res
+                            .as_ref()
+                            .map(|(chat_id, _)| tracing::field::debug(chat_id))
+                            .ok();
+
+                        let chat_span = info_span!("chat", ?chat_id);
                         async move {
                             match res {
                                 Ok((chat_id, raw_messages)) => {
@@ -108,6 +114,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
                                 Err(e) => error!("failed to fetch chat history for chat: {e:?}"),
                             }
                         }
+                        .instrument(chat_span)
                     })
                     .await;
             })
