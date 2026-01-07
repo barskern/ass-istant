@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, error, info, info_span, trace, warn};
+use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use url::Url;
 
 use crate::utils::waitable_lock::WaitableLock;
@@ -91,8 +91,18 @@ impl Manager {
     }
 
     pub async fn run(&mut self, cancel: CancellationToken) {
-        // TODO Verify that this is cancel safe
-        cancel
+        let manager_span = info_span!(
+            "manager",
+            name = &*self.name,
+            client_id = self.config.client_id.as_str(),
+            auth_url = self.config.auth_url.as_str(),
+            token_url = self.config.token_url.as_str(),
+            external_url = self.config.external_url.as_str(),
+        );
+
+        async move {
+            // TODO Verify that this is cancel safe
+            cancel
             .run_until_cancelled_owned(async {
                 match self.read_from_cache().await {
                     Ok(cached_token) => {
@@ -142,6 +152,7 @@ impl Manager {
                                             warn!("failed to write token to cache: {e:?}");
                                         }
                                     }
+                                    .in_current_span()
                                 });
                                 tokio::time::sleep(until_refresh).await;
                             }
@@ -155,8 +166,11 @@ impl Manager {
             })
             .await;
 
-        self.cache_write_tasks.close();
-        self.cache_write_tasks.wait().await;
+            self.cache_write_tasks.close();
+            self.cache_write_tasks.wait().await;
+        }
+        .instrument(manager_span)
+        .await
     }
 
     async fn update_token(&self) -> Result<TokenWrapper> {
@@ -179,11 +193,20 @@ impl Manager {
         let mut token_cache_path = self.config.cache_dir.join(&*self.name);
         token_cache_path.set_extension("json");
 
-        let contents = tokio::fs::read(&token_cache_path)
-            .await
-            .context("failed to open token cache file for reading")?;
+        let span = info_span!("token_cache", ?token_cache_path);
+        async move {
+            let contents = tokio::fs::read(&token_cache_path)
+                .await
+                .context("failed to open token cache file for reading")?;
 
-        serde_json::from_slice(&contents).context("failed to parse token cache")
+            let token = serde_json::from_slice(&contents).context("failed to parse token cache")?;
+
+            debug!("successfully read token from file cache");
+
+            Ok(token)
+        }
+        .instrument(span)
+        .await
     }
 
     /// # Cancel Safety
@@ -204,8 +227,10 @@ impl Manager {
         let mut tmp_token_cache_path = token_cache_path.clone();
         tmp_token_cache_path.set_extension("tmp.json");
 
+        let outer_span = tracing::Span::current();
         task::spawn_blocking(move || {
-            let span = info_span!("write_to_cache", ?token_cache_path);
+            let _ = outer_span.enter();
+            let span = info_span!("token_cache", ?token_cache_path);
             let _ = span.enter();
 
             if let Err(e) = std::fs::create_dir_all(&cache_dir) {
@@ -235,6 +260,8 @@ impl Manager {
 
             std::fs::rename(&tmp_token_cache_path, &token_cache_path)
                 .context("failed to rename temp token file")?;
+
+            debug!("successfully wrote token to file cache");
 
             Ok(())
         })
@@ -338,12 +365,15 @@ impl Manager {
 
             let cancel = CancellationToken::new();
             let _cancel_guard = cancel.clone().drop_guard();
-            tokio::spawn(async move {
-                let _ = axum::serve(listener, router)
-                    .with_graceful_shutdown(cancel.cancelled_owned())
-                    .await;
-                debug!("stopped oauth callback http server");
-            });
+            tokio::spawn(
+                async move {
+                    let _ = axum::serve(listener, router)
+                        .with_graceful_shutdown(cancel.cancelled_owned())
+                        .await;
+                    debug!("stopped oauth callback http server");
+                }
+                .in_current_span(),
+            );
 
             receiver
                 .recv()

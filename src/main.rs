@@ -8,7 +8,7 @@ use tokio::{signal, time};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tracing::level_filters::LevelFilter;
-use tracing::{error, info};
+use tracing::{Instrument, error, info, info_span};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
@@ -53,6 +53,7 @@ async fn main() -> Result<()> {
         platforms.spawn({
             let cancel = cancel.clone();
             let impersonator = Arc::clone(&impersonator);
+            let platform_span = info_span!("platform", name = "mattermost");
             async move {
                 let Ok(mattermost) = platform::mattermost::init(matter_config, cancel.clone())
                     .await
@@ -64,6 +65,7 @@ async fn main() -> Result<()> {
                 let mut platform = platform::Manager::new(mattermost, impersonator);
                 platform.run(cancel.clone()).await
             }
+            .instrument(platform_span)
         });
     }
 
@@ -71,6 +73,7 @@ async fn main() -> Result<()> {
         platforms.spawn({
             let cancel = cancel.clone();
             let impersonator = Arc::clone(&impersonator);
+            let platform_span = info_span!("platform", name = "discord");
             async move {
                 let Ok(discord) = platform::discord::init(discord_config, cancel.clone())
                     .await
@@ -82,6 +85,7 @@ async fn main() -> Result<()> {
                 let mut platform = platform::Manager::new(discord, impersonator);
                 platform.run(cancel.clone()).await
             }
+            .instrument(platform_span)
         });
     }
 

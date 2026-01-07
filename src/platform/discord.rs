@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{Instrument, debug, error, info, trace, warn};
 
 use crate::oauth;
 use crate::platform::{
@@ -48,7 +48,7 @@ pub async fn init(config: Config, cancel: CancellationToken) -> Result<Manager> 
     let token_handle = auth_manager.token_handle();
     background_tasks.spawn({
         let cancel = cancel.clone();
-        async move { auth_manager.run(cancel).await }
+        async move { auth_manager.run(cancel).await }.in_current_span()
     });
 
     let Some(access_token) = cancel

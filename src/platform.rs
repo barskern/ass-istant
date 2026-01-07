@@ -86,44 +86,48 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
             let this = self.to_owned();
             let cancel = cancel.clone();
 
-            cancel.run_until_cancelled_owned(async move {
-                this.inner
-                    .fetch_chat_histories()
-                    .for_each(|res| {
-                        let this = this.clone();
-                        let impersonator = Arc::clone(&this.impersonator);
+            cancel
+                .run_until_cancelled_owned(async move {
+                    this.inner
+                        .fetch_chat_histories()
+                        .for_each(|res| {
+                            let this = this.clone();
+                            let impersonator = Arc::clone(&this.impersonator);
 
-                        let chat_id = res
-                            .as_ref()
-                            .map(|(chat_id, _)| tracing::field::debug(chat_id))
-                            .ok();
+                            let chat_id = res
+                                .as_ref()
+                                .map(|(chat_id, _)| tracing::field::debug(chat_id))
+                                .ok();
 
-                        let chat_span = info_span!("chat", ?chat_id);
-                        async move {
-                            match res {
-                                Ok((chat_id, raw_messages)) => {
-                                    let Some(chat_config) =
-                                        this.inner.common_chat_config(chat_id.as_ref())
-                                    else {
-                                        return;
-                                    };
+                            let chat_span = info_span!("chat", chat_id);
+                            async move {
+                                match res {
+                                    Ok((chat_id, raw_messages)) => {
+                                        let Some(chat_config) =
+                                            this.inner.common_chat_config(chat_id.as_ref())
+                                        else {
+                                            return;
+                                        };
 
-                                    let history = impersonator
-                                        .new_blank_history(chat_id.as_ref(), chat_config)
-                                        .chain(raw_messages)
-                                        .collect();
+                                        let history = impersonator
+                                            .new_blank_history(chat_id.as_ref(), chat_config)
+                                            .chain(raw_messages)
+                                            .collect();
 
-                                    impersonator
-                                        .init_chat_history(chat_id.as_ref(), history)
-                                        .await;
+                                        impersonator
+                                            .init_chat_history(chat_id.as_ref(), history)
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        error!("failed to fetch chat history for chat: {e:?}")
+                                    }
                                 }
-                                Err(e) => error!("failed to fetch chat history for chat: {e:?}"),
                             }
-                        }
-                        .instrument(chat_span)
-                    })
-                    .await;
-            })
+                            .instrument(chat_span)
+                        })
+                        .await;
+                })
+                .in_current_span()
         });
 
         tasks.spawn({
@@ -131,12 +135,14 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
             let cancel = cancel.clone();
             let clean_history_interval = Duration::from_secs(60 * 60);
 
-            cancel.run_until_cancelled_owned(async move {
-                loop {
-                    sleep(clean_history_interval).await;
-                    this.impersonator.clean_histories().await;
-                }
-            })
+            cancel
+                .run_until_cancelled_owned(async move {
+                    loop {
+                        sleep(clean_history_interval).await;
+                        this.impersonator.clean_histories().await;
+                    }
+                })
+                .in_current_span()
         });
 
         // TODO How to log without cloning message?
@@ -149,14 +155,16 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
             let (events_tx, mut events_rx) = mpsc::channel(50);
             this.inner.attach_event_extractor(events_tx);
 
-            cancel.run_until_cancelled_owned(async move {
-                while let Some(chat_event) = events_rx.recv().await {
-                    this.process_event(chat_event).await;
-                    //if let Err(e) = logger_tx.try_send(ev.clone()) {
-                    //    warn!("failed to log event: {e:?}");
-                    //}
-                }
-            })
+            cancel
+                .run_until_cancelled_owned(async move {
+                    while let Some(chat_event) = events_rx.recv().await {
+                        this.process_event(chat_event).await;
+                        //if let Err(e) = logger_tx.try_send(ev.clone()) {
+                        //    warn!("failed to log event: {e:?}");
+                        //}
+                    }
+                })
+                .in_current_span()
         });
 
         if let Err(e) = self.inner.run(cancel.clone()).await {
@@ -236,16 +244,18 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
             let typing_cancel = typing_cancel.clone();
             let chat_id = chat_id.to_owned();
 
-            typing_cancel.run_until_cancelled_owned(async move {
-                sleep(deliberation_time).await;
-                loop {
-                    trace!("sending typing notification...");
-                    this.inner.send_typing_status(chat_id.as_ref()).await;
+            typing_cancel
+                .run_until_cancelled_owned(async move {
+                    sleep(deliberation_time).await;
+                    loop {
+                        trace!("sending typing notification...");
+                        this.inner.send_typing_status(chat_id.as_ref()).await;
 
-                    // TODO Add some noise to make it more realistic?
-                    sleep(typing_notification_interval).await;
-                }
-            })
+                        // TODO Add some noise to make it more realistic?
+                        sleep(typing_notification_interval).await;
+                    }
+                })
+                .in_current_span()
         });
 
         debug!("starting to generate a response...");
@@ -392,6 +402,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
                             }
                         }
                     }.instrument(chat_span)
+                    .in_current_span()
                 });
             }
         }
