@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
         platforms.spawn({
             let cancel = cancel.clone();
             let impersonator = Arc::clone(&impersonator);
-            let platform_span = info_span!("platform", name = "mattermost");
+            let platform_span = info_span!("platform", name = platform::mattermost::PLATFORM_NAME);
             async move {
                 let Ok(mattermost) = platform::mattermost::init(matter_config, cancel.clone())
                     .await
@@ -73,7 +73,7 @@ async fn main() -> Result<()> {
         platforms.spawn({
             let cancel = cancel.clone();
             let impersonator = Arc::clone(&impersonator);
-            let platform_span = info_span!("platform", name = "discord");
+            let platform_span = info_span!("platform", name = platform::discord::PLATFORM_NAME);
             async move {
                 let Ok(discord) = platform::discord::init(discord_config, cancel.clone())
                     .await

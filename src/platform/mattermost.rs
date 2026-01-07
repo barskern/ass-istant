@@ -22,7 +22,7 @@ use crate::platform::{
     ChatConfig as CommonChatConfig, ChatEvent, ChatId, ChatIdRef, ChatMessage, ChatRole, Platform,
 };
 
-const PLATFORM_NAME: &str = "matter";
+pub const PLATFORM_NAME: &str = "matter";
 
 pub fn new_chat_id(channel_id: &str) -> ChatId {
     ChatId::new(PLATFORM_NAME, channel_id)

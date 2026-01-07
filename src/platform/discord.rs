@@ -23,7 +23,7 @@ use crate::platform::{
     ChatConfig as CommonChatConfig, ChatEvent, ChatId, ChatIdRef, ChatMessage, ChatRole, Platform,
 };
 
-const PLATFORM_NAME: &str = "discord";
+pub const PLATFORM_NAME: &str = "discord";
 // See https://discord.com/developers/docs/topics/oauth2#shared-resources-oauth2-scopes
 const REQUIRED_SCOPES: &[&str] = &[
     "identify",
