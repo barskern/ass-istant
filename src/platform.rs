@@ -230,7 +230,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
             };
 
             if !warrants_reply
-                .inspect_err(|e| warn!("failed to for natural end: {e:?}"))
+                .inspect_err(|e| warn!("failed to find natural end: {e:?}"))
                 .unwrap_or(true)
             {
                 debug!("conversation does not warrant reply, stopping");
@@ -239,6 +239,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
         }
 
         let typing_cancel = cancel.child_token();
+        let typing_guard = typing_cancel.clone().drop_guard();
         self.typing_tasks.spawn({
             let this = self.clone();
             let typing_cancel = typing_cancel.clone();
@@ -303,7 +304,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
         }
 
         // Stop sending typing notifications just before we send the real message
-        typing_cancel.cancel();
+        drop(typing_guard);
 
         self.inner
             .send_message(chat_id, &text_message)
