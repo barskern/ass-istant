@@ -302,11 +302,26 @@ pub struct Config {
     chats: ChatsConfig,
 }
 
+impl Config {
+    pub fn ensure_chat_configured(&mut self, chat_id: &ChatIdRef) {
+        let Ok(channel_id) = chat_id
+            .sub_id()
+            .parse()
+            .inspect_err(|e| warn!("got invalid discord chat id '{chat_id}': {e:?}"))
+        else {
+            return;
+        };
+
+        self.chats.channels.entry(channel_id).or_default();
+    }
+}
+
 #[derive(serde::Deserialize, Debug)]
 struct ChatsConfig {
     // TODO Fetch from /users/@me instead
     my_user_id: String,
     bot_token: String,
+    #[serde(default)]
     channels: HashMap<ChannelId, ChannelConfig>,
 }
 
@@ -330,7 +345,7 @@ impl ChatsConfig {
     }
 }
 
-#[derive(serde::Deserialize, Clone, Debug)]
+#[derive(serde::Deserialize, Clone, Debug, Default)]
 struct ChannelConfig {
     #[serde(flatten)]
     common: CommonChatConfig,

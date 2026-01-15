@@ -96,7 +96,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
 
                             let chat_id = res
                                 .as_ref()
-                                .map(|(chat_id, _)| tracing::field::debug(chat_id))
+                                .map(|(chat_id, _)| tracing::field::display(chat_id))
                                 .ok();
 
                             let chat_span = info_span!("chat", chat_id);
@@ -196,6 +196,9 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
         let Some(chat_config) = self.inner.common_chat_config(chat_id) else {
             return Err(anyhow!("did not find chat config"));
         };
+        let Some(persona) = self.impersonator.persona_for_chat(chat_id) else {
+            return Err(anyhow!("did not find persona for chat"));
+        };
 
         let start = Instant::now();
 
@@ -219,7 +222,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
             + time_to_notice_message)
             .min(max_deliberation_time);
 
-        if chat_config.should_detect_natural_end {
+        if persona.should_detect_natural_end {
             debug!("starting to detect natural end..");
             let maybe_warrants_reply = cancel
                 .run_until_cancelled(self.impersonator.warrants_reply(chat_id, chat_config))
@@ -270,6 +273,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
         };
 
         let chat_response = chat_response
+            .inspect(|msg| debug!("got response: {}", msg.content))
             .inspect_err(|e| error!("failed to generate a response: {e:?}"))
             .unwrap_or_else(|_| {
                 let reason = random_rejection_message();
@@ -328,22 +332,17 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
                 content,
                 role,
             } => {
-                let Some(chat_config) = self.inner.common_chat_config(chat_id.as_ref()) else {
-                    warn!("got message from chat '{chat_id:?}' without config");
-                    return;
-                };
-
                 self.processing_tasks.spawn({
                     let this = self.clone();
                     let chat_id = chat_id.to_owned();
-                    let friend_name = &chat_config.friend_name;
                     let mut content = content.to_owned();
 
-                    let chat_span = info_span!("chat", ?chat_id, friend_name);
+                    let chat_span = info_span!("chat", ?chat_id);
 
                     async move {
                         // We have to fetch chat_config again due to lifetimes
                         let Some(chat_config) = this.inner.common_chat_config(chat_id.as_ref()) else {
+                            warn!("got message to chat without chat config");
                             return;
                         };
 
@@ -437,15 +436,10 @@ pub enum ChatRole {
     Other,
 }
 
-#[derive(serde::Deserialize, Clone, Debug)]
+#[derive(serde::Deserialize, Clone, Debug, Default)]
+#[serde(default)]
 pub struct ChatConfig {
-    #[serde(default)]
-    pub should_prefix: bool,
-    pub friend_name: String,
-    #[serde(default)]
-    pub should_detect_natural_end: bool,
-    #[serde(default)]
-    pub custom_system_prompt: Option<String>,
+    should_prefix: bool,
 }
 
 impl ChatConfig {
@@ -491,10 +485,20 @@ impl ChatConfig {
 }
 
 mod types {
-    use std::borrow::Borrow;
+    use std::{borrow::Borrow, fmt::Display};
 
-    use anyhow::{Result, anyhow};
     use ref_cast::{RefCastCustom, ref_cast_custom};
+    use serde::Deserialize;
+
+    #[derive(thiserror::Error, Debug)]
+    pub enum ConvertError {
+        #[error("namespace of id '{raw}' was empty")]
+        EmptyNamespace { raw: String },
+        #[error("data of id '{raw}' was empty")]
+        EmptyData { raw: String },
+        #[error("id '{raw}' missing separator")]
+        MissingSeparator { raw: String },
+    }
 
     #[derive(RefCastCustom, Hash, PartialEq, Eq, Debug)]
     #[repr(transparent)]
@@ -504,15 +508,15 @@ mod types {
         #[ref_cast_custom]
         const unsafe fn new_unchecked(value: &str) -> &Self;
 
-        pub fn try_new(value: &str) -> Result<&Self> {
+        pub fn try_new(value: &str) -> Result<&Self, ConvertError> {
             let Some((ns, sub_id)) = value.split_once(':') else {
-                return Err(anyhow!("missing ':' in chat id"));
+                return Err(ConvertError::MissingSeparator { raw: value.into() });
             };
             if ns.is_empty() {
-                return Err(anyhow!("namespace is empty in chat id"));
+                return Err(ConvertError::EmptyNamespace { raw: value.into() });
             }
             if sub_id.is_empty() {
-                return Err(anyhow!("sub id is empty in chat id"));
+                return Err(ConvertError::EmptyData { raw: value.into() });
             }
 
             unsafe { Ok(Self::new_unchecked(value)) }
@@ -541,12 +545,41 @@ mod types {
         }
     }
 
-    #[derive(Hash, PartialEq, Eq, Clone, Debug)]
+    impl Display for ChatIdRef {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(f)
+        }
+    }
+
+    #[derive(Deserialize, Hash, PartialEq, Eq, Clone, Debug)]
+    #[serde(try_from = "String")]
     pub struct ChatId(String);
 
     impl ChatId {
         pub fn new(ns: &str, data: &str) -> Self {
+            let ns = if !ns.is_empty() { ns } else { "missing" };
+            let data = if !data.is_empty() { data } else { "missing" };
+
             Self(format!("{ns}:{data}"))
+        }
+    }
+
+    impl TryFrom<String> for ChatId {
+        type Error = ConvertError;
+
+        fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+            let Some((ns, data)) = value.split_once(":") else {
+                return Err(ConvertError::MissingSeparator { raw: value });
+            };
+
+            if ns.is_empty() {
+                return Err(ConvertError::EmptyNamespace { raw: value });
+            }
+            if data.is_empty() {
+                return Err(ConvertError::EmptyData { raw: value });
+            }
+
+            Ok(Self(value))
         }
     }
 
@@ -561,6 +594,12 @@ mod types {
         fn as_ref(&self) -> &ChatIdRef {
             // SAFETY: A chat id is always a valid reference
             unsafe { ChatIdRef::new_unchecked(&self.0) }
+        }
+    }
+
+    impl Display for ChatId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(f)
         }
     }
 }

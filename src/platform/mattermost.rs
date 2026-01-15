@@ -22,7 +22,7 @@ use crate::platform::{
     ChatConfig as CommonChatConfig, ChatEvent, ChatId, ChatIdRef, ChatMessage, ChatRole, Platform,
 };
 
-pub const PLATFORM_NAME: &str = "matter";
+pub const PLATFORM_NAME: &str = "mattermost";
 
 pub fn new_chat_id(channel_id: &str) -> ChatId {
     ChatId::new(PLATFORM_NAME, channel_id)
@@ -184,7 +184,7 @@ impl Platform for Manager {
     async fn send_message(&self, chat_id: &ChatIdRef, message: &str) -> Result<()> {
         let channel_id = chat_id.sub_id();
         let Some(channel_config) = self.config.channels.get(channel_id) else {
-            return Err(anyhow!("chat '{chat_id:?}' had no config.."));
+            return Err(anyhow!("chat '{chat_id}' had no config.."));
         };
 
         let channel_id = chat_id.sub_id();
@@ -327,6 +327,15 @@ pub struct Config {
     chats: ChatsConfig,
 }
 
+impl Config {
+    pub fn ensure_chat_configured(&mut self, chat_id: &ChatIdRef) {
+        let channels = &mut self.chats.channels;
+        if !channels.contains_key(chat_id.sub_id()) {
+            channels.insert(chat_id.sub_id().into(), Default::default());
+        }
+    }
+}
+
 #[derive(serde::Deserialize, Debug)]
 struct ChatsConfig {
     // TODO Fetch from /users/me instead
@@ -345,7 +354,7 @@ impl ChatsConfig {
     }
 }
 
-#[derive(serde::Deserialize, Clone, Debug)]
+#[derive(serde::Deserialize, Clone, Debug, Default)]
 struct ChannelConfig {
     #[serde(flatten)]
     common: CommonChatConfig,

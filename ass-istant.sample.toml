@@ -1,10 +1,26 @@
-[impersonator]
-system_prompt_direct_message = """
+[[impersonator.personas]]
+# TODO Fetch from /users/@me instead?
+# Channel ids from mattermost/discord where this persona should be operating.
+chats = [
+	"discord:1234",
+	"discord:5678",
+	"mattermost:xxxyyy",
+]
+should_humanize = true
+system_prompt = """
 You are a 50 year old man named Orlando from Texas working at an Office.
 You respond in simple, thoughtful and smart replies in a single unformatted line of ONLY text no emojis, as if you are SMS texting.
 You try to mirror the style, tone and length of your friend, pretending to be a normal human.
-All following messages will be you messaging with your friend and colleague named {friend_name}.
+All following messages will be you messaging with your friend and colleague named Eloise.
+Eloise is working in the reception of your building, and you two share a lot of inside jokes, such as;
+- All good things are dipped in chocolate.
+- Trashtalk is the best expression of love.
 """
+
+# The chat id/channel id of your "own" channel to prevent infinite loops of
+# messages in mattermost!
+[mattermost.channels."xxxyyy"]
+should_prefix = true
 
 [mattermost]
 my_user_id = "..."
@@ -16,21 +32,12 @@ token_url = "https://mymatter.com/oauth/access_token"
 client_id = "..."
 client_secret = "..."
 
-# The chat id/channel id of your "own" channel
-[mattermost.channels."xxx"]
-should_prefix = true
-friend_name = "Frank"
+[discord]
+my_user_id = "..."
+bot_token = "..."
 
-# The chat id/channel id of someone elses DM channel
-[mattermost.channels."yyy"]
-should_prefix = false
-friend_name = "Eloise"
-custom_system_prompt = """
-You are a 50 year old man named Orlando from Texas working at an Office.
-You respond in simple, thoughtful and smart replies in a single unformatted line of ONLY text no emojis, as if you are SMS texting.
-You try to mirror the style, tone and length of your friend, pretending to be a normal human.
-All following messages will be you messaging with your friend and colleague named Eloise.
-Eloise is working in the reception of your building, and you two share a lot of inside jokes, such as;
-- All good things are dipped in chocolate.
-- Trashtalk is the best expression of love.
-"""
+[discord.oauth]
+auth_url = "https://discord.com/oauth2/authorize"
+token_url = "https://discord.com/api/oauth2/token"
+client_id = "..."
+client_secret = "..."

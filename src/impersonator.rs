@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::iter;
 use std::sync::Arc;
 
@@ -7,7 +7,6 @@ use ollama_rs::Ollama;
 use ollama_rs::generation::chat::request::ChatMessageRequest;
 use ollama_rs::generation::chat::{ChatMessage, MessageRole};
 use ollama_rs::generation::parameters::{KeepAlive, TimeUnit};
-use ollama_rs::models::ModelOptions;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{debug, instrument, trace, warn};
@@ -18,7 +17,6 @@ use crate::platform::{ChatConfig, ChatId, ChatIdRef};
 
 pub struct Impersonator {
     client: Ollama,
-    model_options: ModelOptions,
     config: Config,
 
     // Double mutex by design, as we want to allow modification to the map
@@ -29,14 +27,19 @@ pub struct Impersonator {
 
 impl Impersonator {
     pub fn new(client: Ollama, config: Config) -> Self {
-        let model_options = ModelOptions::default();
-
         Self {
             client,
             config,
-            model_options,
             histories: Default::default(),
         }
+    }
+
+    pub fn persona_for_chat(&self, chat_id: &ChatIdRef) -> Option<&Persona> {
+        // TODO Optimize this search with a index as it is static
+        self.config
+            .personas
+            .iter()
+            .find(|persona| persona.chats.contains(chat_id))
     }
 
     pub async fn init_chat_history(&self, chat_id: &ChatIdRef, messages: Vec<ChatMessage>) {
@@ -46,13 +49,17 @@ impl Impersonator {
             return;
         }
 
-        let Config {
+        let Some(Persona {
             max_chars_in_history,
             at_least_n_messages_in_history,
             ..
-        } = self.config;
+        }) = self.persona_for_chat(chat_id)
+        else {
+            return;
+        };
+
         let mut history = ChatHistory::new(messages);
-        history.clean(max_chars_in_history, at_least_n_messages_in_history);
+        history.clean(*max_chars_in_history, *at_least_n_messages_in_history);
 
         debug!("init history to: {:?}", &history);
         histories.insert(chat_id.to_owned(), Arc::new(Mutex::new(history)));
@@ -60,21 +67,19 @@ impl Impersonator {
 
     pub fn new_blank_history(
         &self,
-        _chat_id: &ChatIdRef,
-        chat_config: &ChatConfig,
+        chat_id: &ChatIdRef,
+        _chat_config: &ChatConfig,
     ) -> impl Iterator<Item = ChatMessage> {
-        [ChatMessage::system(
-            chat_config
-                .custom_system_prompt
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| {
-                    self.config
-                        .system_prompt_direct_message
-                        .replace("{friend_name}", &chat_config.friend_name)
-                }),
-        )]
-        .into_iter()
+        let system_prompt = self
+            .persona_for_chat(chat_id)
+            .map(|p| p.system_prompt.to_owned())
+            // TODO How to handle this gracefully??
+            .unwrap_or_else(|| {
+                warn!("created empty shell history for chat '{chat_id}'");
+                "You are an empty shell of a person...".into()
+            });
+
+        [ChatMessage::system(system_prompt)].into_iter()
     }
 
     pub async fn length_of_unanswered_messages(&self, chat_id: &ChatIdRef) -> Option<usize> {
@@ -122,20 +127,25 @@ impl Impersonator {
 
     /// Ensure that histories are not too big, remove old cruft
     pub async fn clean_histories(&self) {
-        debug!("cleaning history!");
-
-        let Config {
-            max_chars_in_history,
-            at_least_n_messages_in_history,
-            ..
-        } = self.config;
-
+        debug!("cleaning histories!");
         let shared_histories: Vec<_> = {
             let histories = self.histories.lock().await;
-            histories.values().map(Arc::clone).collect()
+            histories
+                .keys()
+                .cloned()
+                .zip(histories.values().map(Arc::clone))
+                .collect()
         };
 
-        for shared_history in shared_histories {
+        for (chat_id, shared_history) in shared_histories {
+            let (max_chars_in_history, at_least_n_messages_in_history) = self
+                .persona_for_chat(chat_id.as_ref())
+                .map(|p| (p.max_chars_in_history, p.at_least_n_messages_in_history))
+                .unwrap_or((
+                    default_max_chars_in_history(),
+                    default_at_least_n_messages_in_history(),
+                ));
+
             {
                 let mut history = shared_history.lock().await;
                 history.clean(max_chars_in_history, at_least_n_messages_in_history);
@@ -160,12 +170,15 @@ impl Impersonator {
             history.messages.clone()
         };
 
-        let request = ChatMessageRequest::new(self.config.model_name.clone(), messages)
-            .options(self.model_options.clone())
-            .keep_alive(KeepAlive::Until {
-                time: 5,
-                unit: TimeUnit::Minutes,
-            });
+        let maybe_persona = self.persona_for_chat(chat_id);
+        let model_name = maybe_persona
+            .map(|p| p.model_name.to_owned())
+            .unwrap_or(default_model_name());
+
+        let request = ChatMessageRequest::new(model_name, messages).keep_alive(KeepAlive::Until {
+            time: 5,
+            unit: TimeUnit::Minutes,
+        });
 
         let start_ollama = Instant::now();
         let mut res = self
@@ -190,7 +203,7 @@ impl Impersonator {
             );
         }
 
-        if !self.config.skip_humanize {
+        if maybe_persona.map(|p| p.should_humanize).unwrap_or(false) {
             let start_humanize = Instant::now();
             res.message.content = self
                 .humanize_message(res.message.content.trim())
@@ -260,10 +273,14 @@ impl Impersonator {
             }
         };
 
+        let maybe_persona = self.persona_for_chat(chat_id);
+        let model_name = maybe_persona
+            .map(|p| p.model_name.to_owned())
+            .unwrap_or(default_model_name());
+
         debug!("asking for natural end of following messages: {messages_to_eval:?}");
-        let request = ChatMessageRequest::new(self.config.model_name.clone(), messages_to_eval)
-            .options(self.model_options.clone())
-            .keep_alive(KeepAlive::Until {
+        let request =
+            ChatMessageRequest::new(model_name, messages_to_eval).keep_alive(KeepAlive::Until {
                 time: 5,
                 unit: TimeUnit::Minutes,
             });
@@ -299,8 +316,7 @@ impl Impersonator {
             ChatMessage::user(message.into()),
         ];
 
-        let request = ChatMessageRequest::new(self.config.model_name.clone(), messages)
-            .options(self.model_options.clone())
+        let request = ChatMessageRequest::new(self.config.humanizer_model_name.clone(), messages)
             .keep_alive(KeepAlive::Until {
                 time: 5,
                 unit: TimeUnit::Minutes,
@@ -329,6 +345,7 @@ impl Impersonator {
         match histories.get(chat_id).map(Arc::clone) {
             Some(v) => v,
             None => {
+                warn!("found blank chat history, initializing to empty..");
                 // Hopefully we don't hit this path, as we rather want the initialized
                 // histories from previous chats (see `init_chat_history`).
                 let new = Arc::new(Mutex::new(ChatHistory::new(
@@ -343,19 +360,41 @@ impl Impersonator {
 
 #[derive(serde::Deserialize, Debug)]
 pub struct Config {
-    pub system_prompt_direct_message: String,
-    #[serde(default = "default_prompt_humanizer")]
-    pub system_prompt_humanizer: String,
+    personas: Vec<Persona>,
+
     #[serde(default = "default_prompt_replier")]
-    pub system_prompt_replier: String,
+    system_prompt_replier: String,
+
+    #[serde(default = "default_prompt_humanizer")]
+    system_prompt_humanizer: String,
     #[serde(default = "default_model_name")]
-    pub model_name: String,
-    #[serde(default = "default_max_chars_in_history")]
-    pub max_chars_in_history: usize,
-    #[serde(default = "default_at_least_n_messages_in_history")]
-    pub at_least_n_messages_in_history: usize,
+    humanizer_model_name: String,
+}
+
+impl Config {
+    pub fn all_configured_chats(&self) -> impl Iterator<Item = &ChatIdRef> {
+        self.personas
+            .iter()
+            .flat_map(|p| p.chats.iter().map(|id| id.as_ref()))
+    }
+}
+
+#[derive(serde::Deserialize, Debug)]
+pub struct Persona {
+    /// The chats in which we will use this persona
+    chats: HashSet<ChatId>,
+
+    system_prompt: String,
     #[serde(default)]
-    pub skip_humanize: bool,
+    pub should_detect_natural_end: bool,
+    #[serde(default)]
+    should_humanize: bool,
+    #[serde(default = "default_model_name")]
+    model_name: String,
+    #[serde(default = "default_max_chars_in_history")]
+    max_chars_in_history: usize,
+    #[serde(default = "default_at_least_n_messages_in_history")]
+    at_least_n_messages_in_history: usize,
 }
 
 fn default_prompt_humanizer() -> String {

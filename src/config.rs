@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use tracing::warn;
 
 use crate::{
     impersonator,
@@ -21,8 +22,41 @@ impl Config {
             .build()
             .context("failed to build configuration")?;
 
-        config
+        let mut config: Config = config
             .try_deserialize()
-            .context("failed to deserialize config")
+            .context("failed to deserialize config")?;
+
+        // Ensure all chats mentioned in a persona, is initialized in the config for each
+        // platform aswell, so it is setup and managed.
+        for chat_id in config.impersonator.all_configured_chats() {
+            // TODO Maybe make a common trait for all platform configs to make this more dynamic?
+            match chat_id.platform_name() {
+                mattermost::PLATFORM_NAME => {
+                    if let Some(mattermost) = &mut config.mattermost {
+                        mattermost.ensure_chat_configured(chat_id);
+                    } else {
+                        warn!(
+                            "chat id '{chat_id}' references non-configured platform '{}'",
+                            mattermost::PLATFORM_NAME
+                        );
+                    }
+                }
+                discord::PLATFORM_NAME => {
+                    if let Some(discord) = &mut config.discord {
+                        discord.ensure_chat_configured(chat_id);
+                    } else {
+                        warn!(
+                            "chat id '{chat_id}' references non-configured platform '{}'",
+                            discord::PLATFORM_NAME
+                        );
+                    }
+                }
+                _ => {
+                    warn!("chat id '{chat_id}' had unknown namespace, ignoring");
+                }
+            }
+        }
+
+        Ok(config)
     }
 }
