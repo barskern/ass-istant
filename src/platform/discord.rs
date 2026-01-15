@@ -39,32 +39,46 @@ pub fn new_chat_id(channel_id: &str) -> ChatId {
 pub async fn init(config: Config, cancel: CancellationToken) -> Result<Manager> {
     let background_tasks = TaskTracker::new();
 
-    let mut oauth_config = config.oauth;
-    oauth_config
-        .scopes
-        .extend(REQUIRED_SCOPES.iter().map(|&s| Scope::new(s.into())));
+    // TODO Maybe not block on oauth as we don't necessarily need it!
+    let mut oauth_http = None;
+    if let Some(mut oauth_config) = config.oauth {
+        oauth_config
+            .scopes
+            .extend(REQUIRED_SCOPES.iter().map(|&s| Scope::new(s.into())));
 
-    let mut auth_manager = oauth::Manager::new(PLATFORM_NAME.into(), oauth_config);
-    let token_handle = auth_manager.token_handle();
-    background_tasks.spawn({
-        let cancel = cancel.clone();
-        async move { auth_manager.run(cancel).await }.in_current_span()
-    });
+        let mut auth_manager = oauth::Manager::new(PLATFORM_NAME.into(), oauth_config);
+        let token_handle = auth_manager.token_handle();
+        background_tasks.spawn({
+            let cancel = cancel.clone();
+            async move { auth_manager.run(cancel).await }.in_current_span()
+        });
 
-    let Some(access_token) = cancel
-        .run_until_cancelled(token_handle.access_token())
-        .await
-    else {
-        return Err(anyhow!("cancelled while waiting for access_token"));
-    };
+        let Some(access_token) = cancel
+            .run_until_cancelled(token_handle.access_token())
+            .await
+        else {
+            return Err(anyhow!("cancelled while waiting for access_token"));
+        };
+        oauth_http = Some(DiscordHttp::new(access_token.secret()));
+    }
 
-    let oauth_http = DiscordHttp::new(access_token.secret());
     let bot_http = DiscordHttp::new(&config.chats.bot_token);
+
+    let mut chats_config = config.chats;
+    if chats_config.my_user_id.is_empty() {
+        let bot_user = bot_http
+            .get_current_user()
+            .await
+            .context("failed to get current user with bot token")?;
+
+        debug!("bot had following info: {bot_user:?}");
+        chats_config.my_user_id = bot_user.id.to_string();
+    }
 
     let handler = Arc::new(Handler {
         oauth_http,
         bot_http,
-        config: config.chats,
+        config: chats_config,
         sender_tx: OnceLock::new(),
     });
 
@@ -249,7 +263,7 @@ impl Platform for Manager {
 
 #[allow(unused)]
 pub struct Handler {
-    oauth_http: DiscordHttp,
+    oauth_http: Option<DiscordHttp>,
     bot_http: DiscordHttp,
     config: ChatsConfig,
     sender_tx: OnceLock<mpsc::Sender<ChatEvent>>,
@@ -297,7 +311,8 @@ impl EventHandler for Handler {
 
 #[derive(serde::Deserialize, Debug)]
 pub struct Config {
-    oauth: crate::oauth::Config,
+    #[serde(default)]
+    oauth: Option<crate::oauth::Config>,
     #[serde(flatten)]
     chats: ChatsConfig,
 }
@@ -318,7 +333,8 @@ impl Config {
 
 #[derive(serde::Deserialize, Debug)]
 struct ChatsConfig {
-    // TODO Fetch from /users/@me instead
+    // Populated from /users/@me if empty
+    #[serde(default)]
     my_user_id: String,
     bot_token: String,
     #[serde(default)]

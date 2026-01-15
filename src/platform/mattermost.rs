@@ -54,9 +54,25 @@ pub async fn init(config: Config, cancel: CancellationToken) -> Result<Manager> 
         .await
         .context("failed to store session token")?;
 
+    let mut chats_config = config.chats;
+    if chats_config.my_user_id.is_empty() {
+        let current_user = api
+            .query::<serde_json::Value>(Method::GET.as_str(), "users/me", None, None)
+            .await
+            .context("failed to get current user")?;
+
+        debug!("got current user from api: {current_user:?}");
+
+        chats_config.my_user_id = current_user
+            .get("id")
+            .and_then(|v| v.as_str())
+            .context("failed to extract current user id")?
+            .into();
+    }
+
     Ok(Manager {
         api,
-        config: Arc::new(config.chats),
+        config: Arc::new(chats_config),
         sender_tx: Arc::new(OnceLock::new()),
         background_tasks,
     })
@@ -338,7 +354,8 @@ impl Config {
 
 #[derive(serde::Deserialize, Debug)]
 struct ChatsConfig {
-    // TODO Fetch from /users/me instead
+    // Fetched from /users/me if empty
+    #[serde(default)]
     my_user_id: String,
     channels: HashMap<String, ChannelConfig>,
 }

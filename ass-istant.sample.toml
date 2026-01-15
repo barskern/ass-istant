@@ -23,7 +23,6 @@ Eloise is working in the reception of your building, and you two share a lot of 
 should_prefix = true
 
 [mattermost]
-my_user_id = "..."
 instance_url = "https://mymatter.com"
 
 [mattermost.oauth]
@@ -33,7 +32,6 @@ client_id = "..."
 client_secret = "..."
 
 [discord]
-my_user_id = "..."
 bot_token = "..."
 
 [discord.oauth]
