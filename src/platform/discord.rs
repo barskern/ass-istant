@@ -208,7 +208,10 @@ impl Platform for Manager {
                         .into_iter()
                         .inspect(|m| trace!(?m, "got discord message"))
                         .filter_map(|m| {
-                            let message = chat_config.common.preprocess_message(m.content.clone());
+                            let message = chat_config
+                                .common
+                                .preprocess_message(m.content.clone(), &m.author.name);
+
                             handler.config.determine_role(&m).map(|r| match r {
                                 ChatRole::Me => OllamaChatMessage::assistant(message),
                                 ChatRole::Other => OllamaChatMessage::user(message),
@@ -291,6 +294,7 @@ impl EventHandler for Handler {
         let chat_event = ChatEvent::Message {
             chat_id: new_chat_id(&msg.channel_id.to_string()),
             content: ChatMessage {
+                from_user_name: msg.author.name.to_string(),
                 from_user_id: msg.author.id.to_string(),
                 message: msg.content,
             },
@@ -344,6 +348,7 @@ struct ChatsConfig {
 impl From<Message> for ChatMessage {
     fn from(msg: Message) -> Self {
         Self {
+            from_user_name: msg.author.name,
             from_user_id: msg.author.id.to_string(),
             message: msg.content,
         }

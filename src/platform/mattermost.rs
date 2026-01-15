@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -152,6 +152,18 @@ impl Platform for Manager {
                         .await
                         .context("failed to download chat posts")?;
 
+                    let unique_user_ids: HashSet<_> =
+                        res.posts.values().map(|p| p.user_id.as_str()).collect();
+
+                    debug!(user_ids = ?unique_user_ids, "fetching users...");
+
+                    // TODO Cache results as users are relatively static
+                    let users: Vec<User> = this
+                        .api
+                        .post("users/ids", None, &unique_user_ids)
+                        .await
+                        .context("failed to fetch user info for users")?;
+
                     let raw_message_history: Vec<_> = res
                         .order
                         .iter()
@@ -159,7 +171,12 @@ impl Platform for Manager {
                         .filter_map(|post_id| res.posts.remove(post_id))
                         .inspect(|m| trace!(?m, "got matter post"))
                         .filter_map(|m| {
-                            let message = chat_config.common.preprocess_message(m.message.clone());
+                            let user = users.iter().find(|u| u.id == m.user_id)?;
+
+                            let message = chat_config
+                                .common
+                                .preprocess_message(m.message.clone(), &user.first_name);
+
                             this.config.determine_role(&m).map(|r| match r {
                                 ChatRole::Me => OllamaChatMessage::assistant(message),
                                 ChatRole::Other => OllamaChatMessage::user(message),
@@ -284,9 +301,24 @@ impl WebsocketHandler for Manager {
                         ..
                     } = post_event.content;
 
+                    let Ok(user) = self
+                        .api
+                        .query::<User>(
+                            Method::GET.as_str(),
+                            &format!("/users/{user_id}"),
+                            None,
+                            None,
+                        )
+                        .await
+                        .inspect_err(|e| error!("failed to fetch info on user '{user_id}': {e:?}"))
+                    else {
+                        return;
+                    };
+
                     let chat_event = ChatEvent::Message {
                         chat_id: new_chat_id(&channel_id),
                         content: ChatMessage {
+                            from_user_name: user.first_name,
                             from_user_id: user_id,
                             message,
                         },
@@ -389,6 +421,14 @@ impl ChannelConfig {
 
 #[derive(Deserialize, Clone, Debug)]
 #[allow(unused)]
+struct User {
+    id: String,
+    first_name: String,
+    last_name: String,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[allow(unused)]
 struct Post {
     message: String,
     user_id: String,
@@ -400,6 +440,8 @@ struct Post {
 impl From<Post> for ChatMessage {
     fn from(value: Post) -> Self {
         ChatMessage {
+            // Populated later on due to not being present in Post from mattermost
+            from_user_name: String::new(),
             from_user_id: value.user_id,
             message: value.message,
         }

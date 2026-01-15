@@ -346,7 +346,7 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
                             return;
                         };
 
-                        content.message = chat_config.preprocess_message(content.message);
+                        content.message = chat_config.preprocess_message(content.message, &content.from_user_name);
 
                         match role {
                             ChatRole::Me => {
@@ -427,6 +427,7 @@ pub enum ChatEvent {
 #[derive(Clone, Debug)]
 pub struct ChatMessage {
     from_user_id: String,
+    from_user_name: String,
     message: String,
 }
 
@@ -439,29 +440,56 @@ pub enum ChatRole {
 #[derive(serde::Deserialize, Clone, Debug, Default)]
 #[serde(default)]
 pub struct ChatConfig {
-    should_prefix: bool,
+    should_prefix_llm: bool,
+    multiple_users: bool,
 }
 
 impl ChatConfig {
-    pub fn preprocess_message(&self, message: String) -> String {
-        let Self { should_prefix, .. } = self;
-        if *should_prefix {
+    pub fn preprocess_message(&self, message: String, author: &str) -> String {
+        let Self {
+            should_prefix_llm,
+            multiple_users,
+        } = self;
+
+        let message = if *should_prefix_llm {
             // In a prefixing chat, we remove AI prefix before sending to the LLM
-            message.trim_start_matches(AI_PREFIX).trim().to_string()
+            message.trim_start_matches(AI_PREFIX).trim()
         } else {
             // In a non-prefixing chat, we remove the command prefix before sending to the LLM
-            message.trim_start_matches(CMD_PREFIX).trim().to_string()
+            message.trim_start_matches(CMD_PREFIX).trim()
+        };
+
+        if *multiple_users {
+            format!("{author}: {message}")
+        } else {
+            message.to_string()
         }
     }
 
     pub fn postprocess_message(&self, message: String) -> String {
-        let Self { should_prefix, .. } = self;
-        if *should_prefix {
+        let Self {
+            should_prefix_llm,
+            multiple_users,
+        } = self;
+
+        // If message has a ':' in the first 30 characters, we assume it is the "name" of the person,
+        // and we strip it before we send the message to the platform.
+        let message = if *multiple_users && message[..message.len().min(30)].contains(':') {
+            message
+                .split_once(':')
+                .map(|(_, m)| m)
+                .unwrap_or(&message)
+                .trim()
+        } else {
+            message.trim()
+        };
+
+        if *should_prefix_llm {
             // In a prefixing chat, we remove AI prefix before sending to the LLM
             format!("{AI_PREFIX}{message}")
         } else {
             // In a non-prefixing chat, do nothing (for now)
-            message
+            message.to_string()
         }
     }
 
@@ -470,7 +498,7 @@ impl ChatConfig {
         let has_cmd_prefix = m.message.starts_with(CMD_PREFIX);
         let from_me = m.from_user_id == my_user_id;
 
-        let is_me = if self.should_prefix {
+        let is_me = if self.should_prefix_llm {
             // We are in a prefixed chat, all messages with AI prefix is me,
             // all other messages are others
             has_ai_prefix
