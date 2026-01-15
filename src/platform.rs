@@ -12,7 +12,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 
 use crate::impersonator::Impersonator;
-use crate::utils::human_message_duration;
+use crate::utils::{human_message_duration, random_rejection_message};
 
 pub mod discord;
 pub mod mattermost;
@@ -269,7 +269,13 @@ impl<M: Platform + Sync + Send + Clone + 'static> Manager<M> {
             return Ok(());
         };
 
-        let chat_response = chat_response.context("generating a response")?;
+        let chat_response = chat_response
+            .inspect_err(|e| error!("failed to generate a response: {e:?}"))
+            .unwrap_or_else(|_| {
+                let reason = random_rejection_message();
+                warn!("sending random builtin rejection message: {reason}");
+                OllamaChatMessage::assistant(reason.into())
+            });
 
         let elapsed = start.elapsed();
         let answer_time = (deliberation_time
