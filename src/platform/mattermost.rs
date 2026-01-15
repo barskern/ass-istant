@@ -158,11 +158,14 @@ impl Platform for Manager {
                     debug!(user_ids = ?unique_user_ids, "fetching users...");
 
                     // TODO Cache results as users are relatively static
-                    let users: Vec<User> = this
-                        .api
-                        .post("users/ids", None, &unique_user_ids)
-                        .await
-                        .context("failed to fetch user info for users")?;
+                    let users: Vec<User> = if !unique_user_ids.is_empty() {
+                        this.api
+                            .post("users/ids", None, &unique_user_ids)
+                            .await
+                            .context("failed to fetch user info for users")?
+                    } else {
+                        Vec::new()
+                    };
 
                     let raw_message_history: Vec<_> = res
                         .order
