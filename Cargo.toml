@@ -10,7 +10,6 @@ axum = "0.8.6"
 chrono = { version = "0.4.42", features = ["serde"] }
 config = "0.15.18"
 dashmap = "6.1.0"
-directories = "6.0.0"
 futures = "0.3.31"
 mattermost_api = { version = "0.8.2", features = ["rustls"] }
 oauth2 = "5.0.0"

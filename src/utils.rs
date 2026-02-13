@@ -1,16 +1,10 @@
-use std::env;
-use std::sync::LazyLock;
 use std::time::Duration;
 
-use directories::ProjectDirs;
 use rand::Rng;
 use rand::seq::IteratorRandom;
 use rand_distr::Exp;
 
 pub mod waitable_lock;
-
-pub static PROJECT_DIRS: LazyLock<ProjectDirs> =
-    LazyLock::new(|| ProjectDirs::from("", "", env!("CARGO_PKG_NAME")).unwrap());
 
 pub fn human_message_duration(chars: usize, chars_per_sec: f32) -> Duration {
     let expected_message_time = chars as f32 / chars_per_sec;

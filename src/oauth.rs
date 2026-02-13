@@ -24,6 +24,7 @@ use tokio_util::task::TaskTracker;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use url::Url;
 
+use crate::config::default_cache_dir;
 use crate::utils::waitable_lock::WaitableLock;
 
 #[derive(Clone, Debug)]
@@ -432,7 +433,7 @@ impl TokenWrapper {
 
 #[derive(serde::Deserialize, Debug)]
 pub struct Config {
-    #[serde(default = "default_cache_dir")]
+    #[serde(default = "default_oauth_cache_dir")]
     pub cache_dir: PathBuf,
     #[serde(default = "default_token_grace_period")]
     pub token_grace_period: Duration,
@@ -453,10 +454,8 @@ fn default_external_url() -> Url {
     Url::parse("http://localhost:8080").unwrap()
 }
 
-fn default_cache_dir() -> PathBuf {
-    crate::utils::PROJECT_DIRS
-        .cache_dir()
-        .join("token_responses")
+fn default_oauth_cache_dir() -> PathBuf {
+    default_cache_dir().join("token_responses")
 }
 
 fn default_token_grace_period() -> Duration {

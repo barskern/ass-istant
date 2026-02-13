@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
-use tracing::warn;
+use std::{env, path::PathBuf};
+use tracing::{trace, warn};
 
 use crate::{
     impersonator,
@@ -59,4 +60,30 @@ impl Config {
 
         Ok(config)
     }
+}
+
+pub fn default_config_dir() -> PathBuf {
+    path_from_env("XDG_CONFIG_HOME")
+        .or_else(|| env::home_dir().map(|h| h.join(".config/")))
+        .map(|cfg_dir| cfg_dir.join(env!("CARGO_PKG_NAME")))
+        .unwrap_or_else(|| {
+            concat!("/opt/", env!("CARGO_PKG_NAME"), "/etc/")
+                .parse()
+                .unwrap()
+        })
+}
+
+pub fn default_cache_dir() -> PathBuf {
+    path_from_env("XDG_CACHE_HOME")
+        .or_else(|| env::home_dir().map(|h| h.join(".cache/")))
+        .map(|cdir| cdir.join(env!("CARGO_PKG_NAME")))
+        .unwrap_or_else(|| env::temp_dir().join(concat!(env!("CARGO_PKG_NAME"), "/")))
+}
+
+fn path_from_env(name: &str) -> Option<PathBuf> {
+    let maybe_path = env::var_os(name).map(PathBuf::from);
+    if maybe_path.is_none() {
+        trace!(var_name = name, "did not find env var '{}'", name);
+    }
+    maybe_path
 }
