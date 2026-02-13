@@ -15,8 +15,8 @@ mattermost_api = { version = "0.8.2", features = ["rustls"] }
 oauth2 = "5.0.0"
 ollama-rs = { version = "0.3.3", features = ["rustls", "tokio"] }
 pretty_assertions = { version = "1.4.1", features = ["unstable"] }
-rand = "0.9.2"
-rand_distr = "0.5.1"
+rand = "0.10.0"
+rand_distr = "0.6.0"
 ref-cast = "1.0.25"
 serde = { version = "1.0.228", features = ["derive"] }
 serde-nested-json = "0.1.3"
